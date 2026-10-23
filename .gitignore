@@ -1,0 +1,11 @@
+.env
+
+logs/*
+!logs/.gitkeep
+
+config/*
+!config/.gitkeep
+
+__pycache__/
+.pytest_cache/
+*.py[cod]
