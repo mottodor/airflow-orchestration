@@ -54,6 +54,28 @@ BEGIN
         SELECT 1
         FROM (
             VALUES
+                ('change_id', 'text', 'NO'),
+                ('reason', 'text', 'NO'),
+                ('affected_date', 'date', 'NO'),
+                ('payload_sha256', 'text', 'NO'),
+                ('event_count', 'bigint', 'NO'),
+                ('committed_at', 'timestamp with time zone', 'NO')
+        ) AS expected(column_name, data_type, is_nullable)
+        LEFT JOIN information_schema.columns AS actual
+          ON actual.table_schema = 'orders_demo'
+         AND actual.table_name = 'ingestion_changes'
+         AND actual.column_name = expected.column_name
+        WHERE actual.column_name IS NULL
+           OR actual.data_type <> expected.data_type
+           OR actual.is_nullable <> expected.is_nullable
+    ) THEN
+        RAISE EXCEPTION 'ingestion_changes column contract does not match';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM (
+            VALUES
                 ('event_id', 'bigint', 'NO', 'YES'),
                 ('order_id', 'text', 'NO', 'NO'),
                 ('order_ts', 'timestamp with time zone', 'NO', 'NO'),
@@ -93,6 +115,82 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'daily_order_aggregates column contract does not match';
     END IF;
+END;
+$$;
+
+INSERT INTO orders_demo.ingestion_changes (
+    change_id,
+    reason,
+    affected_date,
+    payload_sha256,
+    event_count
+)
+SELECT
+    order_id_prefix || 'change',
+    'schema_test',
+    aggregate_date,
+    repeat('a', 64),
+    4
+FROM schema_test_fixture;
+
+DO $$
+DECLARE
+    v_change_id text;
+BEGIN
+    SELECT order_id_prefix || 'change'
+    INTO STRICT v_change_id
+    FROM schema_test_fixture;
+
+    BEGIN
+        INSERT INTO orders_demo.ingestion_changes (
+            change_id, reason, affected_date, payload_sha256, event_count
+        )
+        SELECT
+            v_change_id,
+            'schema_test',
+            aggregate_date,
+            repeat('a', 64),
+            4
+        FROM schema_test_fixture;
+        RAISE EXCEPTION 'duplicate ingestion change_id was accepted';
+    EXCEPTION
+        WHEN unique_violation THEN NULL;
+    END;
+
+    BEGIN
+        UPDATE orders_demo.ingestion_changes
+        SET reason = 'mutated'
+        WHERE change_id = v_change_id;
+        RAISE EXCEPTION 'ingestion change update was accepted';
+    EXCEPTION
+        WHEN SQLSTATE '55000' THEN NULL;
+    END;
+
+    BEGIN
+        DELETE FROM orders_demo.ingestion_changes
+        WHERE change_id = v_change_id;
+        RAISE EXCEPTION 'ingestion change delete was accepted';
+    EXCEPTION
+        WHEN SQLSTATE '55000' THEN NULL;
+    END;
+
+    BEGIN
+        TRUNCATE TABLE orders_demo.ingestion_changes;
+        RAISE EXCEPTION 'ingestion change truncate was accepted';
+    EXCEPTION
+        WHEN SQLSTATE '55000' THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO orders_demo.ingestion_changes (
+            change_id, reason, affected_date, payload_sha256, event_count
+        ) VALUES (
+            'invalid-hash', 'schema_test', DATE '2025-03-01', 'xyz', 1
+        );
+        RAISE EXCEPTION 'invalid ingestion payload hash was accepted';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
 END;
 $$;
 

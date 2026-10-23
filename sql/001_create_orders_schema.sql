@@ -2,6 +2,54 @@ BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS orders_demo;
 
+CREATE TABLE IF NOT EXISTS orders_demo.ingestion_changes (
+    change_id text PRIMARY KEY,
+    reason text NOT NULL,
+    affected_date date NOT NULL,
+    payload_sha256 text NOT NULL,
+    event_count bigint NOT NULL,
+    committed_at timestamp with time zone NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT ingestion_changes_change_id_not_blank
+        CHECK (btrim(change_id) <> ''),
+    CONSTRAINT ingestion_changes_reason_not_blank
+        CHECK (btrim(reason) <> ''),
+    CONSTRAINT ingestion_changes_affected_date_finite
+        CHECK (isfinite(affected_date)),
+    CONSTRAINT ingestion_changes_payload_sha256_format
+        CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ingestion_changes_event_count_positive
+        CHECK (event_count > 0),
+    CONSTRAINT ingestion_changes_committed_at_finite
+        CHECK (isfinite(committed_at))
+);
+
+COMMENT ON TABLE orders_demo.ingestion_changes IS
+    'Immutable idempotency receipts for ingestion change_id values and canonical payloads.';
+
+CREATE OR REPLACE FUNCTION orders_demo.reject_ingestion_change_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'orders_demo.ingestion_changes is append-only; % is not allowed', TG_OP
+        USING ERRCODE = '55000';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS ingestion_changes_reject_update_delete
+    ON orders_demo.ingestion_changes;
+CREATE TRIGGER ingestion_changes_reject_update_delete
+    BEFORE UPDATE OR DELETE ON orders_demo.ingestion_changes
+    FOR EACH ROW
+    EXECUTE FUNCTION orders_demo.reject_ingestion_change_mutation();
+
+DROP TRIGGER IF EXISTS ingestion_changes_reject_truncate
+    ON orders_demo.ingestion_changes;
+CREATE TRIGGER ingestion_changes_reject_truncate
+    BEFORE TRUNCATE ON orders_demo.ingestion_changes
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION orders_demo.reject_ingestion_change_mutation();
+
 CREATE TABLE IF NOT EXISTS orders_demo.raw_order_events (
     event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     order_id text NOT NULL,

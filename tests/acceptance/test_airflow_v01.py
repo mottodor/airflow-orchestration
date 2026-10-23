@@ -343,6 +343,16 @@ class AggregateSnapshot:
     source_max_updated_at: datetime | None
 
 
+@dataclass(frozen=True)
+class IngestionStorageState:
+    receipt_count: int
+    reason: str
+    affected_date: date
+    payload_sha256: str
+    event_count: int
+    raw_event_count: int
+
+
 def _aggregate_snapshot(
     connect: Callable[[], Any],
     target_date: date,
@@ -393,6 +403,50 @@ def _aggregate(connect: Callable[[], Any], target_date: date) -> Aggregate:
         row_count=int(row_count),
         order_count=int(order_count) if order_count is not None else 0,
         sales_amount=Decimal(sales_amount) if sales_amount is not None else Decimal("0"),
+    )
+
+
+def _ingestion_storage_state(
+    connect: Callable[[], Any],
+    change_id: str,
+    order_id: str,
+) -> IngestionStorageState:
+    connection = connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    count(*),
+                    max(change.reason),
+                    max(change.affected_date),
+                    max(change.payload_sha256),
+                    max(change.event_count),
+                    (
+                        SELECT count(*)
+                        FROM orders_demo.raw_order_events AS raw
+                        WHERE raw.order_id = %s
+                    )
+                FROM orders_demo.ingestion_changes AS change
+                WHERE change.change_id = %s
+                """,
+                (order_id, change_id),
+            )
+            row = cursor.fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    assert row[1] is not None
+    assert row[2] is not None
+    assert row[3] is not None
+    assert row[4] is not None
+    return IngestionStorageState(
+        receipt_count=int(row[0]),
+        reason=str(row[1]),
+        affected_date=row[2],
+        payload_sha256=str(row[3]),
+        event_count=int(row[4]),
+        raw_event_count=int(row[5]),
     )
 
 
@@ -754,7 +808,7 @@ def connect() -> Callable[[], Any]:
 
 @pytest.fixture(scope="session")
 def scenario_dates(connect: Callable[[], Any]) -> dict[str, Any]:
-    dates = _unused_dates(connect, 12)
+    dates = _unused_dates(connect, 13)
     return {
         "canonical": dates[0],
         "boundary": dates[1:3],
@@ -764,12 +818,102 @@ def scenario_dates(connect: Callable[[], Any]) -> dict[str, Any]:
         "parallel": dates[6:8],
         "pool": dates[8:11],
         "timeout": dates[11],
+        "ingestion_retry": dates[12],
     }
 
 
 @pytest.fixture(scope="session")
 def run_token() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def test_ingestion_retry_after_commit_emits_one_asset_event_without_duplicates(
+    api: AirflowApi,
+    connect: Callable[[], Any],
+    scenario_dates: dict[str, Any],
+    run_token: str,
+) -> None:
+    target_date = scenario_dates["ingestion_retry"]
+    run_id = f"r01-{run_token}-post-commit-retry"
+    change_id = f"r01-{run_token}-post-commit-change"
+    order_id = f"r01-{run_token}-post-commit-order"
+    event_timestamp = _day_timestamp(target_date, 12)
+    api.trigger(
+        INGESTION_DAG_ID,
+        run_id,
+        {
+            "change_id": change_id,
+            "reason": "post_commit_retry_probe",
+            "demo_fail_after_commit_once": True,
+            "events": [
+                {
+                    "order_id": order_id,
+                    "order_ts": _utc_isoformat(event_timestamp),
+                    "amount": 42.00,
+                    "updated_at": _utc_isoformat(event_timestamp),
+                    "ingested_at": _utc_isoformat(event_timestamp),
+                }
+            ],
+        },
+    )
+
+    _wait_for_task_state(
+        api,
+        INGESTION_DAG_ID,
+        run_id,
+        {"up_for_retry"},
+        timeout=40,
+    )
+    committed_state = _ingestion_storage_state(connect, change_id, order_id)
+    assert committed_state.receipt_count == 1
+    assert committed_state.reason == "post_commit_retry_probe"
+    assert committed_state.affected_date == target_date
+    assert len(committed_state.payload_sha256) == 64
+    assert committed_state.event_count == 1
+    assert committed_state.raw_event_count == 1
+    assert api.asset_events(run_id) == []
+
+    _wait_for_run(api, INGESTION_DAG_ID, run_id, "success")
+    task_instance = api.task_instance(INGESTION_DAG_ID, run_id)
+    assert task_instance["state"] == "success"
+    assert task_instance["try_number"] == 2
+    assert api.xcom(INGESTION_DAG_ID, run_id, INGESTION_TASK_ID) == {
+        "affected_date": target_date.isoformat(),
+        "reason": "post_commit_retry_probe",
+        "change_id": change_id,
+        "inserted_event_count": 0,
+        "change_replayed": True,
+    }
+    assert _ingestion_storage_state(connect, change_id, order_id) == committed_state
+
+    def event_with_dispatcher() -> dict[str, Any] | None:
+        events = api.asset_events(run_id)
+        if len(events) != 1 or not events[0]["created_dagruns"]:
+            return None
+        return events[0]
+
+    asset_event = _wait_until(
+        "post-commit retry Asset event and dispatcher run",
+        event_with_dispatcher,
+        timeout=60,
+    )
+    assert asset_event["extra"] == {
+        "affected_date": target_date.isoformat(),
+        "reason": "post_commit_retry_probe",
+        "change_id": change_id,
+    }
+    dispatcher_reference = next(
+        reference
+        for reference in asset_event["created_dagruns"]
+        if reference["dag_id"] == DISPATCHER_DAG_ID
+    )
+    dispatcher_run_id = dispatcher_reference["run_id"]
+    _wait_for_run(api, DISPATCHER_DAG_ID, dispatcher_run_id, "success")
+
+    source_token = hashlib.sha256(dispatcher_run_id.encode()).hexdigest()[:16]
+    target_run_id = f"late_data__{target_date.isoformat()}__{source_token}"
+    _wait_for_run(api, DAILY_DAG_ID, target_run_id, "success", timeout=120)
+    assert _aggregate(connect, target_date) == Aggregate(1, 1, Decimal("42.00"))
 
 
 def test_canonical_fixture_repeat_boundary_and_successful_late_order(

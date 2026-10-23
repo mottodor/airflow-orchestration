@@ -50,7 +50,7 @@ docker compose exec -T postgres \
 
 ## Приём изменений заказов
 
-DAG `orders_ingestion` запускается вручную и принимает непустой `change_id`, причину изменения и массив append-only версий заказов. Все события одного запуска должны относиться ровно к одной календарной UTC-дате. После успешной записи DAG публикует Asset event таблицы `orders_demo.raw_order_events` с metadata `affected_date`, `reason` и `change_id`. Asset-triggered DAG `orders_late_data_dispatcher` группирует накопленные события по `affected_date` и создаёт по одному целевому запуску `orders_daily_aggregate` на уникальную дату.
+DAG `orders_ingestion` запускается вручную и принимает непустой `change_id`, причину изменения и массив append-only версий заказов. Все события одного запуска должны относиться ровно к одной календарной UTC-дате. Запись raw events и immutable receipt для `change_id` выполняются одной PostgreSQL-транзакцией. Повтор того же `change_id` с тем же нормализованным содержимым не добавляет raw events повторно, но успешно публикует Asset event; повтор с другим содержимым завершается ошибкой. Ingestion task имеет один retry через 5 секунд, поэтому transient-сбой после commit и до регистрации Asset event восстанавливается без дублирования входа. После успешной попытки DAG публикует Asset event таблицы `orders_demo.raw_order_events` с metadata `affected_date`, `reason` и `change_id`. Asset-triggered DAG `orders_late_data_dispatcher` группирует накопленные события по `affected_date` и создаёт по одному целевому запуску `orders_daily_aggregate` на уникальную дату.
 
 Пример запуска:
 
@@ -104,7 +104,7 @@ docker compose run --rm airflow-cli airflow dags trigger orders_daily_aggregate 
 
 Каждая попытка расчёта пишет одной JSON-записью операторскую сводку: дату и причину запуска, число прочитанных и выбранных заказов, старый и новый агрегаты, состояние публикации, ожидание блокировки, номер попытки и ошибку. Успешная сводка возвращается задачей как XCom `return_value`; при ошибке, включая timeout, JSON записывается до повторного возбуждения исключения, а старый агрегат остаётся опубликованным.
 
-Параметры `demo_delay_seconds` и `demo_fail_first_attempt` предназначены только для локальных acceptance/concurrency/timeout probes. Первый удерживает транзакцию перед публикацией, второй один раз завершает первую попытку после чтения старого агрегата, но до публикации. По умолчанию оба механизма отвергаются; для явно тестового запуска stack нужно стартовать с `DEMO_FAULT_INJECTION_ENABLED=true`.
+Параметры `demo_delay_seconds`, `demo_fail_first_attempt` и ingestion-параметр `demo_fail_after_commit_once` предназначены только для локальных acceptance/concurrency/timeout/recovery probes. Первый удерживает транзакцию перед публикацией, второй один раз завершает первую попытку после чтения старого агрегата, но до публикации, третий имитирует сбой ingestion после PostgreSQL commit и до Asset event. По умолчанию все механизмы отвергаются; для явно тестового запуска stack нужно стартовать с `DEMO_FAULT_INJECTION_ENABLED=true`.
 
 Локальные unit tests DAG:
 
@@ -126,16 +126,18 @@ docker compose exec -T postgres \
 
 docker run --rm --network airflow-orchestration_default \
   -e ORDERS_TEST_DSN=postgresql://airflow:airflow@postgres:5432/orders_demo \
+  -v "$PWD/dags:/opt/airflow/dags:ro" \
   -v "$PWD/tests:/opt/airflow/tests:ro" \
   -w /opt/airflow \
   --entrypoint pytest \
   airflow-orchestration:3.1.6 \
-  -q tests/integration/test_daily_aggregate_concurrency.py
+  -q tests/integration/test_orders_ingestion.py \
+     tests/integration/test_daily_aggregate_concurrency.py
 ```
 
 ## Airflow-level acceptance suite (V-01)
 
-Acceptance suite использует реальный scheduler/Celery worker, Airflow API v2, Asset events, task logs, XCom и обе PostgreSQL-базы. Вместе с SQL, unit и PostgreSQL integration tests она автоматически покрывает AC-01—AC-13; на Airflow-level дополнительно воспроизводятся эталон R1–R4 и поздний заказ C, повторный расчёт, UTC-граница, retry, успешный и ошибочный late-data пересчёт, сериализация одной даты, параллельность разных дат, pool, реальный timeout и фактический success XCom. Для безопасных fault/concurrency/timeout probes Airflow-сервисы временно запускаются с явно включённой test-only инъекцией:
+Acceptance suite использует реальный scheduler/Celery worker, Airflow API v2, Asset events, task logs, XCom и обе PostgreSQL-базы. Вместе с SQL, unit и PostgreSQL integration tests она автоматически покрывает AC-01—AC-13; на Airflow-level дополнительно воспроизводятся эталон R1–R4 и поздний заказ C, повторный расчёт, UTC-граница, retry, успешный и ошибочный late-data пересчёт, сериализация одной даты, параллельность разных дат, pool, реальный timeout, восстановление ingestion после сбоя между commit и Asset event и фактический success XCom. Для безопасных fault/concurrency/timeout probes Airflow-сервисы временно запускаются с явно включённой test-only инъекцией:
 
 ```bash
 DEMO_FAULT_INJECTION_ENABLED=true \

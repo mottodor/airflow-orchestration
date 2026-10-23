@@ -311,3 +311,34 @@ Suite выбирает незанятые даты 2200—2299 и уникаль
 
 ### Next action
 Use `bc93814` as the current acceptance baseline. Remaining work is optional and tracked in section 10: user acceptance, CI, a decision on R-01, and optional cleanup of local runtime history.
+
+## TASK_ID: R-01
+
+- Source: `docs/status.md` §8 «R-01 — Commit ingestion и Asset event не атомарны»; user invocation `/skill:implement R-01`
+- Status: REVIEW_READY
+- Updated: 2026-10-24T00:11:53+03:00
+- Baseline HEAD: 0cfe1d1019f3830d446d10a80752fead9904e28d
+
+### Progress
+- Implemented: added an immutable `ingestion_changes` receipt keyed by `change_id`; canonical payload hashing (including normalization of signed zero) and conflict rejection; transactional receipt + raw-event insertion; one ingestion retry after 5 seconds; safe replay that emits the missing Asset event without reinserting raw events; test-only first-attempt failure after commit; unit, PostgreSQL integration, and Airflow E2E coverage; README commands and behavior documentation
+- Remaining: none
+
+### AC evidence
+| AC / ссылка на источник | Result | Проверка / evidence / причина |
+|---|---|---|
+| `docs/status.md` §8 R-01 — limited ingestion retry | PASS | fast + acceptance; task-definition assertion confirms `retries=1` and 5-second delay; real Airflow run finished on try 2 after first-attempt post-commit failure |
+| `docs/status.md` §8 R-01 — storage-level idempotent `change_id` | PASS | standard; schema reapply and repeat schema integration passed; real PostgreSQL test committed one receipt and one raw event, accepted equivalent `-0.00`/`0.00` replay with zero inserts, and rejected conflicting reuse without changing storage; final targeted ingestion integration passed in 5.64s |
+| `docs/status.md` §8 R-01 — post-commit failure recovery | PASS | acceptance; targeted Airflow scenario passed in 21.65s and full 8-scenario suite passed in 125.91s: first attempt reached `up_for_retry` with one durable raw event and no Asset event, retry emitted exactly one Asset event, dispatcher/target run succeeded, and aggregate became `1 / 42.00` |
+| Existing `docs/spec.md` §5 AC-01—AC-13 regression | PASS | fast + standard + acceptance; final 58 unit tests passed in 5.48s, schema and aggregate SQL integration passed, DAG import errors absent, and all 8 Airflow scenarios passed |
+
+### Issues
+none
+
+### Review
+- Verdict: OK
+- Calls: 3
+- Fix iterations: 1
+- Details: reviewer call 1 returned `VERDICT OK` with one non-blocking signed-zero improvement; the targeted fix and affected checks passed. Reviewer call 2 returned `VERDICT OK` for the complete diff and final evidence. Reviewer call 3 returned `VERDICT OK` for the status-only correction and confirmed that no general text or other task section changed. DEFERRED: storage-level idempotency starts at the R-01 schema cutover because historical raw rows do not contain `change_id`; replay of a pre-R-01 change ID cannot be recognized retroactively. Runtime is healthy with fault injection restored to false and the persistent PostgreSQL volume preserved.
+
+### Next action
+User reviews the R-01 checkpoint and decides whether to create the proposed commit.
