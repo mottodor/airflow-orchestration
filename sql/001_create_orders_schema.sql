@@ -82,4 +82,94 @@ CREATE TABLE IF NOT EXISTS orders_demo.daily_order_aggregates (
 COMMENT ON TABLE orders_demo.daily_order_aggregates IS
     'Currently published daily aggregates; aggregate_date is the single active result key.';
 
+CREATE OR REPLACE FUNCTION orders_demo.publish_daily_order_aggregate(
+    p_aggregate_date date
+)
+RETURNS TABLE (
+    records_read bigint,
+    order_count bigint,
+    sales_amount numeric,
+    published_at timestamp with time zone,
+    source_max_updated_at timestamp with time zone
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_records_read bigint;
+    v_order_count bigint;
+    v_sales_amount numeric;
+    v_published_at timestamp with time zone;
+    v_source_max_updated_at timestamp with time zone;
+    v_repeated_order_id text;
+BEGIN
+    IF p_aggregate_date IS NULL OR NOT isfinite(p_aggregate_date) THEN
+        RAISE EXCEPTION 'aggregate date must be finite and non-null'
+            USING ERRCODE = '22007';
+    END IF;
+
+    SELECT
+        count(*),
+        count(DISTINCT order_id),
+        COALESCE(sum(amount), 0),
+        max(updated_at)
+    INTO
+        v_records_read,
+        v_order_count,
+        v_sales_amount,
+        v_source_max_updated_at
+    FROM orders_demo.raw_order_events
+    WHERE order_ts >= (p_aggregate_date::timestamp AT TIME ZONE 'UTC')
+      AND order_ts < ((p_aggregate_date + 1)::timestamp AT TIME ZONE 'UTC');
+
+    IF v_records_read <> v_order_count THEN
+        SELECT order_id
+        INTO v_repeated_order_id
+        FROM orders_demo.raw_order_events
+        WHERE order_ts >= (p_aggregate_date::timestamp AT TIME ZONE 'UTC')
+          AND order_ts < ((p_aggregate_date + 1)::timestamp AT TIME ZONE 'UTC')
+        GROUP BY order_id
+        HAVING count(*) > 1
+        ORDER BY order_id
+        LIMIT 1;
+
+        RAISE EXCEPTION 'raw input contains multiple records for order_id %',
+            v_repeated_order_id;
+    END IF;
+
+    v_published_at := clock_timestamp();
+
+    INSERT INTO orders_demo.daily_order_aggregates (
+        aggregate_date,
+        order_count,
+        sales_amount,
+        published_at,
+        source_max_updated_at
+    )
+    VALUES (
+        p_aggregate_date,
+        v_order_count,
+        v_sales_amount,
+        v_published_at,
+        v_source_max_updated_at
+    )
+    ON CONFLICT (aggregate_date) DO UPDATE
+    SET
+        order_count = EXCLUDED.order_count,
+        sales_amount = EXCLUDED.sales_amount,
+        published_at = EXCLUDED.published_at,
+        source_max_updated_at = EXCLUDED.source_max_updated_at;
+
+    RETURN QUERY
+    SELECT
+        v_records_read,
+        v_order_count,
+        v_sales_amount,
+        v_published_at,
+        v_source_max_updated_at;
+END;
+$$;
+
+COMMENT ON FUNCTION orders_demo.publish_daily_order_aggregate(date) IS
+    'Calculates and atomically upserts one UTC day. Version resolution is added separately.';
+
 COMMIT;

@@ -68,6 +68,20 @@ docker compose run --rm airflow-cli airflow dags trigger orders_ingestion \
   }'
 ```
 
+## Дневной агрегат
+
+DAG `orders_daily_aggregate` работает по дневному UTC-расписанию. Scheduled/backfill run берёт дату из своего data interval; для ручного целевого запуска требуется параметр `affected_date` в формате `YYYY-MM-DD`. Расчёт и `UPSERT` одной активной строки даты выполняются в одной PostgreSQL-транзакции.
+
+```bash
+docker compose run --rm airflow-cli airflow dags unpause orders_daily_aggregate
+
+docker compose run --rm airflow-cli airflow dags trigger orders_daily_aggregate \
+  --run-id example-daily-2025-03-01 \
+  --conf '{"affected_date": "2025-03-01"}'
+```
+
+На этапе IMP-03 дата с несколькими raw-записями одного `order_id` отклоняется до публикации, чтобы не публиковать неоднозначный результат. Выбор последней версии, игнорирование точных копий и точная классификация конфликтов входят в следующий отдельный шаг IMP-04.
+
 Локальные unit tests DAG:
 
 ```bash
@@ -76,7 +90,15 @@ docker run --rm --entrypoint pytest \
   -v "$PWD/tests:/opt/airflow/tests:ro" \
   -w /opt/airflow \
   airflow-orchestration:3.1.6 \
-  -q tests/unit/test_orders_ingestion.py
+  -q tests/unit
+```
+
+После применения схемы integration-проверка дневного расчёта запускается так:
+
+```bash
+docker compose exec -T postgres \
+  psql -v ON_ERROR_STOP=1 -U airflow -d orders_demo \
+  < tests/integration/test_daily_aggregate.sql
 ```
 
 ## Остановка
