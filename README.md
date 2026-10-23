@@ -135,7 +135,7 @@ docker run --rm --network airflow-orchestration_default \
 
 ## Airflow-level acceptance suite (V-01)
 
-Acceptance suite использует реальный scheduler/Celery worker, Airflow API v2, Asset events, task logs, XCom и обе PostgreSQL-базы. Она проверяет AC-02, AC-07, AC-08, AC-09, AC-10 и AC-12. Для безопасных fault/concurrency probes Airflow-сервисы временно запускаются с явно включённой test-only инъекцией:
+Acceptance suite использует реальный scheduler/Celery worker, Airflow API v2, Asset events, task logs, XCom и обе PostgreSQL-базы. Вместе с SQL, unit и PostgreSQL integration tests она автоматически покрывает AC-01—AC-13; на Airflow-level дополнительно воспроизводятся эталон R1–R4 и поздний заказ C, повторный расчёт, UTC-граница, retry, успешный и ошибочный late-data пересчёт, сериализация одной даты, параллельность разных дат, pool, реальный timeout и фактический success XCom. Для безопасных fault/concurrency/timeout probes Airflow-сервисы временно запускаются с явно включённой test-only инъекцией:
 
 ```bash
 DEMO_FAULT_INJECTION_ENABLED=true \

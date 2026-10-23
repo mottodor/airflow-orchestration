@@ -253,3 +253,59 @@ Suite выбирает незанятые даты 2200—2299 и уникаль
 - После исправления дефект не удаляется: его статус меняется на `RESOLVED`, добавляются commit и выполненные проверки.
 - Числа запусков и состояние локального volume являются evidence конкретной проверки, а не переносимым свойством проекта.
 - Общий статус становится `READY_FOR_ACCEPTANCE`, когда нет blocker-дефектов и обязательные AC имеют достаточное runtime evidence.
+
+## TASK_ID: IMP-08
+
+- Source: `docs/bootstrap.md` §6, строка IMP-08; `docs/spec.md` §4 «Утверждённый эталон данных» и §5 AC-01—AC-13
+- Status: REVIEW_READY
+- Updated: 2026-10-23T23:23:41+03:00
+- Baseline HEAD: 8b8da7d52a5e731ce6ec6c434090cdb1c774080c
+
+### Progress
+- Implemented: extended `tests/acceptance/test_airflow_v01.py` to run the approved R1–R4 fixture, repeat calculation, adjacent UTC-boundary fixtures, successful late order C through ingestion/Asset/dispatcher, and a real two-attempt Airflow timeout; isolated all seven Airflow scenarios on 12 consecutive unused dates; updated `README.md` coverage description
+- Remaining: none
+
+### AC evidence
+| AC / ссылка на источник | Result | Проверка / evidence / причина |
+|---|---|---|
+| `docs/spec.md` §5 AC-01 | PASS | acceptance; full suite exit 0, canonical Airflow run published exactly one `2 / 170.00` aggregate from four R1–R4 records |
+| `docs/spec.md` §5 AC-02 | PASS | acceptance; full suite exit 0, fail-first attempt preserved `1 / 10.00`, retry published one `2 / 17.00` row |
+| `docs/spec.md` §5 AC-03 | PASS | standard + acceptance; SQL repeat remained one `2 / 170.00` row, and repeated Airflow calculation remained one row with unchanged values |
+| `docs/spec.md` §5 AC-04 | PASS | standard + acceptance; R1–R4 selected latest A=120 once, ignored its exact copy, and produced `2 / 170.00` |
+| `docs/spec.md` §5 AC-05 | PASS | standard + acceptance; conflicting same-version rows failed before publication and preserved the old aggregate |
+| `docs/spec.md` §5 AC-06 | PASS | acceptance; targeted scenario exit 0 in 18.79s: test held the date advisory lock, observed the automatic target task blocked on `pg_advisory_xact_lock`, verified the exact old `2 / 170.00` snapshot remained visible, then released the lock and observed one `3 / 200.00` row after success |
+| `docs/spec.md` §5 AC-07 | PASS | acceptance; conflicting late-data target run failed after both attempts and preserved the prior `1 / 20.00` snapshot |
+| `docs/spec.md` §5 AC-08 | PASS | standard + acceptance; same-date Airflow runs overlapped at task level, second reported lock wait and published current `11 / 66.00` input |
+| `docs/spec.md` §5 AC-09 | PASS | standard + acceptance; different-date calculations overlapped and published independent aggregates |
+| `docs/spec.md` §5 AC-10 | PASS | fast + acceptance; success/failure JSON logs had the exact required key set and success XCom matched the logged summary and SQL result |
+| `docs/spec.md` §5 AC-11 | PASS | standard + acceptance; `23:59:59Z` and next-day `00:00:00Z` fixtures published only in their respective adjacent UTC dates |
+| `docs/spec.md` §5 AC-12 | PASS | acceptance; pool API observed 2 running slots, 0 open slots and one `scheduled`/`queued` task; third task started after a slot was released |
+| `docs/spec.md` §5 AC-13 | PASS | acceptance; both real 10-second timeout attempts failed before publication, retained the old snapshot and logged `AirflowTaskTimeout` with `old_result_preserved` |
+
+### Issues
+#### IMP-08/B01
+- State: RESOLVED
+- Category: ENVIRONMENT
+- Affects: fast syntax check
+- Problem: the first `py_compile` probe attempted to create bytecode in the read-only tests mount
+- Evidence: `docker run ... python -m py_compile tests/acceptance/test_airflow_v01.py` exited 1 with `Errno 30 Read-only file system`
+- Unblock: use a non-writing parser assertion for read-only mounted sources
+- Resolution: `docker run ... python -c '... ast.parse(...) ...'` exited 0 and printed `acceptance syntax: ok`; `pytest --collect-only` then collected all 7 scenarios
+
+#### IMP-08/B02
+- State: RESOLVED
+- Category: TEST
+- Affects: `docs/spec.md` §5 AC-06; EVIDENCE_GATE; FRESH_READ_ONLY_REVIEW
+- Problem: the successful automatic late-data acceptance scenario checks the baseline before ingestion and the result after target success, but does not observe the old aggregate while the target calculation is in progress
+- Evidence: reviewer call 1 returned `VERDICT BLOCK`; first targeted fix run then exited 1 after 29.19s because the lock-wait observer filtered `pg_stat_activity.query` for the aggregate function while the blocked query was `pg_advisory_xact_lock`; the held lock exceeded 10 seconds and caused an expected task timeout before retry success
+- Unblock: correct the observer to recognize the blocked `pg_advisory_xact_lock` query, then rerun the isolated automatic late-data scenario and confirm the snapshot assertion before timeout
+- Resolution: observer now matches `pg_advisory_xact_lock`; targeted Airflow scenario passed in 18.79s and asserted the baseline snapshot while the automatic target task was blocked, before a successful `3 / 200.00` publication
+
+### Review
+- Verdict: OK
+- Calls: 3
+- Fix iterations: 1
+- Details: Reviewer call 1 blocked missing in-progress AC-06 evidence. Targeted fix iteration 1 added and verified the external advisory-lock snapshot assertion. Reviewer calls 2 and 3 returned `VERDICT OK`; call 3 confirmed the status-only progress correction and full tracked diff remain review-ready, with no blocker or deferred issue. P2 improvement: the preserved legacy global status table still says the acceptance file has 5 scenarios although the current file has 7; this known non-blocking inconsistency was not changed because IMP-08 status updates must preserve existing general text and non-task sections. Runtime is running/healthy with fault injection false; PostgreSQL volume is preserved.
+
+### Next action
+User reviews the three-file checkpoint and decides whether to create the proposed commit.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time as datetime_time, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import json
@@ -427,6 +427,112 @@ def _insert_order_versions(
         connection.close()
 
 
+def _insert_canonical_r1_r4(
+    connect: Callable[[], Any],
+    target_date: date,
+    order_prefix: str,
+) -> None:
+    order_a = f"{order_prefix}-A"
+    order_b = f"{order_prefix}-B"
+    order_a_ts = _day_timestamp(target_date, 10)
+    order_b_ts = _day_timestamp(target_date, 11)
+    version_a_100 = _day_timestamp(target_date, 10)
+    version_b_50 = _day_timestamp(target_date, 11)
+    version_a_120 = _day_timestamp(target_date, 12)
+    rows = [
+        (order_a, order_a_ts, Decimal("100.00"), version_a_100, version_a_100),
+        (order_b, order_b_ts, Decimal("50.00"), version_b_50, version_b_50),
+        (order_a, order_a_ts, Decimal("120.00"), version_a_120, version_a_120),
+        (
+            order_a,
+            order_a_ts,
+            Decimal("120.00"),
+            version_a_120,
+            version_a_120 + timedelta(minutes=1),
+        ),
+    ]
+
+    connection = connect()
+    try:
+        with connection.cursor() as cursor:
+            for order_id, order_ts, amount, updated_at, ingested_at in rows:
+                cursor.execute(
+                    """
+                    INSERT INTO orders_demo.raw_order_events (
+                        order_id,
+                        order_ts,
+                        amount,
+                        updated_at,
+                        ingested_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (order_id, order_ts, amount, updated_at, ingested_at),
+                )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _insert_boundary_fixture(
+    connect: Callable[[], Any],
+    first_date: date,
+    order_prefix: str,
+) -> None:
+    second_date = first_date + timedelta(days=1)
+    first_timestamp = datetime.combine(
+        first_date,
+        datetime_time(23, 59, 59),
+        tzinfo=timezone.utc,
+    )
+    second_timestamp = datetime.combine(
+        second_date,
+        datetime_time.min,
+        tzinfo=timezone.utc,
+    )
+    rows = [
+        (
+            f"{order_prefix}-before-midnight",
+            first_timestamp,
+            Decimal("11.00"),
+            first_timestamp,
+            first_timestamp,
+        ),
+        (
+            f"{order_prefix}-at-midnight",
+            second_timestamp,
+            Decimal("22.00"),
+            second_timestamp,
+            second_timestamp,
+        ),
+    ]
+
+    connection = connect()
+    try:
+        with connection.cursor() as cursor:
+            for order_id, order_ts, amount, updated_at, ingested_at in rows:
+                cursor.execute(
+                    """
+                    INSERT INTO orders_demo.raw_order_events (
+                        order_id,
+                        order_ts,
+                        amount,
+                        updated_at,
+                        ingested_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (order_id, order_ts, amount, updated_at, ingested_at),
+                )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def _insert_new_version(
     connect: Callable[[], Any],
     target_date: date,
@@ -480,7 +586,7 @@ def _unused_dates(connect: Callable[[], Any], count: int) -> list[date]:
                     SELECT day::date AS candidate_date
                     FROM generate_series(
                         DATE '2200-01-01',
-                        DATE '2299-12-31',
+                        DATE '2299-12-31' - %s,
                         INTERVAL '1 day'
                     ) AS day
                 )
@@ -490,23 +596,25 @@ def _unused_dates(connect: Callable[[], Any], count: int) -> list[date]:
                     SELECT 1
                     FROM orders_demo.raw_order_events AS raw
                     WHERE raw.order_ts >= candidate_date::timestamp AT TIME ZONE 'UTC'
-                      AND raw.order_ts < (candidate_date + 1)::timestamp AT TIME ZONE 'UTC'
+                      AND raw.order_ts <
+                          (candidate_date + %s)::timestamp AT TIME ZONE 'UTC'
                 )
                   AND NOT EXISTS (
                     SELECT 1
                     FROM orders_demo.daily_order_aggregates AS aggregate
-                    WHERE aggregate.aggregate_date = candidate_date
+                    WHERE aggregate.aggregate_date >= candidate_date
+                      AND aggregate.aggregate_date < candidate_date + %s
                 )
                 ORDER BY candidate_date
-                LIMIT %s
+                LIMIT 1
                 """,
-                (count,),
+                (count, count, count),
             )
-            dates = [row[0] for row in cursor.fetchall()]
+            row = cursor.fetchone()
     finally:
         connection.close()
-    assert len(dates) == count, dates
-    return dates
+    assert row is not None, f"could not allocate {count} consecutive unused dates"
+    return [row[0] + timedelta(days=offset) for offset in range(count)]
 
 
 def _wait_for_date_calculation_sleep(
@@ -547,6 +655,46 @@ def _wait_for_date_calculation_sleep(
     _wait_until(
         f"calculation for {target_date} to enter pg_sleep after reading input",
         calculation_is_sleeping,
+        timeout=timeout,
+    )
+
+
+def _wait_for_date_lock_waiter(
+    connect: Callable[[], Any],
+    target_date: date,
+    *,
+    timeout: float = 10,
+) -> None:
+    lock_key = target_date.toordinal()
+
+    def calculation_is_waiting_for_lock() -> bool:
+        connection = connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_locks AS lock
+                        INNER JOIN pg_stat_activity AS activity
+                            ON activity.pid = lock.pid
+                        WHERE lock.locktype = 'advisory'
+                          AND lock.classid = %s
+                          AND lock.objid = %s
+                          AND NOT lock.granted
+                          AND activity.datname = current_database()
+                          AND activity.query LIKE '%%pg_advisory_xact_lock%%'
+                    )
+                    """,
+                    (LOCK_NAMESPACE, lock_key),
+                )
+                return bool(cursor.fetchone()[0])
+        finally:
+            connection.close()
+
+    _wait_until(
+        f"calculation for {target_date} to wait for the advisory lock",
+        calculation_is_waiting_for_lock,
         timeout=timeout,
     )
 
@@ -606,19 +754,155 @@ def connect() -> Callable[[], Any]:
 
 @pytest.fixture(scope="session")
 def scenario_dates(connect: Callable[[], Any]) -> dict[str, Any]:
-    dates = _unused_dates(connect, 8)
+    dates = _unused_dates(connect, 12)
     return {
-        "retry": dates[0],
-        "late_failure": dates[1],
-        "same_date": dates[2],
-        "parallel": dates[3:5],
-        "pool": dates[5:8],
+        "canonical": dates[0],
+        "boundary": dates[1:3],
+        "retry": dates[3],
+        "late_failure": dates[4],
+        "same_date": dates[5],
+        "parallel": dates[6:8],
+        "pool": dates[8:11],
+        "timeout": dates[11],
     }
 
 
 @pytest.fixture(scope="session")
 def run_token() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def test_canonical_fixture_repeat_boundary_and_successful_late_order(
+    api: AirflowApi,
+    connect: Callable[[], Any],
+    scenario_dates: dict[str, Any],
+    run_token: str,
+) -> None:
+    target_date = scenario_dates["canonical"]
+    order_prefix = f"imp08-{run_token}-canonical"
+    _insert_canonical_r1_r4(connect, target_date, order_prefix)
+
+    first_run_id = f"imp08-{run_token}-canonical-first"
+    _manual_daily_run(api, first_run_id, target_date)
+    assert _aggregate(connect, target_date) == Aggregate(1, 2, Decimal("170.00"))
+    first_summary = api.xcom(DAILY_DAG_ID, first_run_id, DAILY_TASK_ID)
+    assert first_summary["records_read"] == 4
+    assert first_summary["unique_orders"] == 2
+    assert first_summary["new_aggregate"]["order_count"] == 2
+    assert first_summary["new_aggregate"]["sales_amount"] == "170.00"
+
+    repeat_run_id = f"imp08-{run_token}-canonical-repeat"
+    _manual_daily_run(api, repeat_run_id, target_date)
+    assert _aggregate(connect, target_date) == Aggregate(1, 2, Decimal("170.00"))
+    baseline_snapshot = _aggregate_snapshot(connect, target_date)
+
+    boundary_dates = scenario_dates["boundary"]
+    assert boundary_dates[1] == boundary_dates[0] + timedelta(days=1)
+    _insert_boundary_fixture(
+        connect,
+        boundary_dates[0],
+        f"imp08-{run_token}-boundary",
+    )
+    _manual_daily_run(api, f"imp08-{run_token}-boundary-first", boundary_dates[0])
+    _manual_daily_run(api, f"imp08-{run_token}-boundary-second", boundary_dates[1])
+    assert _aggregate(connect, boundary_dates[0]) == Aggregate(
+        1,
+        1,
+        Decimal("11.00"),
+    )
+    assert _aggregate(connect, boundary_dates[1]) == Aggregate(
+        1,
+        1,
+        Decimal("22.00"),
+    )
+
+    ingestion_run_id = f"imp08-{run_token}-late-order-c"
+    change_id = f"imp08-{run_token}-late-order-c"
+    order_c_updated_at = datetime.combine(
+        target_date + timedelta(days=2),
+        datetime_time(hour=9),
+        tzinfo=timezone.utc,
+    )
+    lock_connection = connect()
+    try:
+        with lock_connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(%s, %s)",
+                (LOCK_NAMESPACE, target_date.toordinal()),
+            )
+
+        api.trigger(
+            INGESTION_DAG_ID,
+            ingestion_run_id,
+            {
+                "change_id": change_id,
+                "reason": "late_order",
+                "events": [
+                    {
+                        "order_id": f"{order_prefix}-C",
+                        "order_ts": _utc_isoformat(_day_timestamp(target_date, 15)),
+                        "amount": 30.00,
+                        "updated_at": _utc_isoformat(order_c_updated_at),
+                        "ingested_at": _utc_isoformat(
+                            order_c_updated_at + timedelta(minutes=1)
+                        ),
+                    }
+                ],
+            },
+        )
+        _wait_for_run(api, INGESTION_DAG_ID, ingestion_run_id, "success")
+
+        def event_with_dispatcher() -> dict[str, Any] | None:
+            events = api.asset_events(ingestion_run_id)
+            if len(events) != 1 or not events[0]["created_dagruns"]:
+                return None
+            return events[0]
+
+        asset_event = _wait_until(
+            "canonical late-order Asset event and dispatcher run",
+            event_with_dispatcher,
+            timeout=60,
+        )
+        assert asset_event["extra"] == {
+            "affected_date": target_date.isoformat(),
+            "reason": "late_order",
+            "change_id": change_id,
+        }
+        dispatcher_reference = next(
+            reference
+            for reference in asset_event["created_dagruns"]
+            if reference["dag_id"] == DISPATCHER_DAG_ID
+        )
+        dispatcher_run_id = dispatcher_reference["run_id"]
+        _wait_for_run(api, DISPATCHER_DAG_ID, dispatcher_run_id, "success")
+
+        source_token = hashlib.sha256(dispatcher_run_id.encode()).hexdigest()[:16]
+        target_run_id = f"late_data__{target_date.isoformat()}__{source_token}"
+        _wait_for_task_state(api, DAILY_DAG_ID, target_run_id, {"running"})
+        _wait_for_date_lock_waiter(connect, target_date)
+        assert _aggregate_snapshot(connect, target_date) == baseline_snapshot
+    finally:
+        lock_connection.rollback()
+        lock_connection.close()
+
+    _wait_for_run(api, DAILY_DAG_ID, target_run_id, "success", timeout=120)
+    assert _aggregate(connect, target_date) == Aggregate(1, 3, Decimal("200.00"))
+
+    late_summary = api.xcom(DAILY_DAG_ID, target_run_id, DAILY_TASK_ID)
+    assert late_summary["initial_trigger_reason"] == "late_data"
+    assert late_summary["records_read"] == 5
+    assert late_summary["unique_orders"] == 3
+    assert late_summary["old_aggregate"] == {
+        "order_count": 2,
+        "sales_amount": "170.00",
+        "published_at": _utc_isoformat(baseline_snapshot.published_at),
+        "source_max_updated_at": _utc_isoformat(
+            baseline_snapshot.source_max_updated_at
+        ),
+    }
+    assert late_summary["new_aggregate"]["order_count"] == 3
+    assert late_summary["new_aggregate"]["sales_amount"] == "200.00"
+    assert late_summary["publication_state"] == "published"
 
 
 def test_fail_first_retry_preserves_then_replaces_and_exposes_xcom(
@@ -839,6 +1123,62 @@ def test_failed_late_data_target_keeps_old_result_and_exposes_asset_metadata(
     assert failure_summary["lock_wait_ms"] == 0.0
     assert failure_summary["try_number"] == 2
     assert "conflicting records" in failure_summary["error"]
+
+
+def test_real_timeout_preserves_the_published_aggregate_and_reports_error(
+    api: AirflowApi,
+    connect: Callable[[], Any],
+    scenario_dates: dict[str, Any],
+    run_token: str,
+) -> None:
+    target_date = scenario_dates["timeout"]
+    order_a = f"imp08-{run_token}-timeout-a"
+    order_b = f"imp08-{run_token}-timeout-b"
+    _insert_order_versions(connect, target_date, [(order_a, Decimal("10.00"), 10)])
+    _manual_daily_run(api, f"imp08-{run_token}-timeout-baseline", target_date)
+    baseline_snapshot = _aggregate_snapshot(connect, target_date)
+
+    _insert_new_version(connect, target_date, order_a, Decimal("12.00"), 11)
+    _insert_order_versions(connect, target_date, [(order_b, Decimal("5.00"), 12)])
+
+    timeout_run_id = f"imp08-{run_token}-timeout"
+    api.trigger(
+        DAILY_DAG_ID,
+        timeout_run_id,
+        {
+            "affected_date": target_date.isoformat(),
+            "reason": "backfill",
+            "demo_delay_seconds": 15,
+        },
+    )
+    _wait_for_task_state(api, DAILY_DAG_ID, timeout_run_id, {"running"})
+    _wait_for_date_calculation_sleep(connect, target_date)
+    assert _aggregate_snapshot(connect, target_date) == baseline_snapshot
+
+    _wait_for_run(api, DAILY_DAG_ID, timeout_run_id, "failed", timeout=90)
+    task_instance = api.task_instance(DAILY_DAG_ID, timeout_run_id)
+    assert task_instance["state"] == "failed"
+    assert task_instance["try_number"] == 2
+    assert _aggregate_snapshot(connect, target_date) == baseline_snapshot
+
+    timeout_summary = _summary_from_log(
+        api.task_log(DAILY_DAG_ID, timeout_run_id, DAILY_TASK_ID, 2)
+    )
+    assert timeout_summary["affected_date"] == target_date.isoformat()
+    assert timeout_summary["trigger_reason"] == "retry"
+    assert timeout_summary["initial_trigger_reason"] == "backfill"
+    assert timeout_summary["old_aggregate"] == {
+        "order_count": 1,
+        "sales_amount": "10.00",
+        "published_at": _utc_isoformat(baseline_snapshot.published_at),
+        "source_max_updated_at": _utc_isoformat(
+            baseline_snapshot.source_max_updated_at
+        ),
+    }
+    assert timeout_summary["new_aggregate"] is None
+    assert timeout_summary["publication_state"] == "old_result_preserved"
+    assert timeout_summary["try_number"] == 2
+    assert timeout_summary["error"].startswith("AirflowTaskTimeout: Timeout, PID:")
 
 
 def test_same_date_airflow_runs_serialize_and_second_reads_late_order(
