@@ -250,6 +250,42 @@ def test_demo_delay_is_available_for_explicit_local_probes(
     ) == 1.5
 
 
+def test_demo_fail_first_attempt_is_rejected_without_fault_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DEMO_FAULT_INJECTION_ENABLED", raising=False)
+
+    with pytest.raises(ValueError, match="requires DEMO_FAULT_INJECTION_ENABLED"):
+        orders_daily_aggregate._resolve_demo_fail_before_publish(
+            {"params": {"demo_fail_first_attempt": True}},
+            1,
+        )
+
+
+def test_demo_fail_first_attempt_only_fails_the_first_try(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEMO_FAULT_INJECTION_ENABLED", "true")
+    context = {"params": {"demo_fail_first_attempt": True}}
+
+    assert orders_daily_aggregate._resolve_demo_fail_before_publish(context, 1) is True
+    assert orders_daily_aggregate._resolve_demo_fail_before_publish(context, 2) is False
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_demo_fail_first_attempt_requires_a_boolean(
+    value: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEMO_FAULT_INJECTION_ENABLED", "true")
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        orders_daily_aggregate._resolve_demo_fail_before_publish(
+            {"params": {"demo_fail_first_attempt": value}},
+            1,
+        )
+
+
 @pytest.mark.parametrize("value", [True, "1", -1, 61])
 def test_invalid_demo_delay_is_rejected(
     value: object,
@@ -361,6 +397,35 @@ def test_publish_rolls_back_and_closes_on_database_failure() -> None:
             hook=FakeHook(connection),
         )
 
+    assert connection.commits == 0
+    assert connection.rollbacks == 1
+    assert connection.closes == 1
+
+
+def test_demo_fail_first_attempt_reads_old_result_then_rolls_back() -> None:
+    connection = FakeConnection(
+        [
+            (True,),
+            (
+                1,
+                Decimal("10.00"),
+                datetime(2025, 3, 1, 13, 0, tzinfo=timezone.utc),
+                datetime(2025, 3, 1, 11, 0, tzinfo=timezone.utc),
+            ),
+        ]
+    )
+    progress: dict[str, Any] = {}
+
+    with pytest.raises(RuntimeError, match="demo fail-first attempt"):
+        orders_daily_aggregate._publish_daily_aggregate(
+            date(2025, 3, 1),
+            demo_fail_before_publish=True,
+            hook=FakeHook(connection),
+            progress=progress,
+        )
+
+    assert len(connection.cursor_instance.executions) == 2
+    assert progress["old_aggregate"]["sales_amount"] == "10.00"
     assert connection.commits == 0
     assert connection.rollbacks == 1
     assert connection.closes == 1
@@ -524,6 +589,7 @@ def test_dag_has_the_daily_utc_data_interval_contract() -> None:
     assert task.execution_timeout.total_seconds() == 10
     assert task.retries == 1
     assert task.retry_delay.total_seconds() == 5
+    assert dag.params["demo_fail_first_attempt"] is False
     assert task.on_retry_callback == [
         orders_daily_aggregate._failure_summary_callback
     ]

@@ -93,6 +93,14 @@ def _resolve_affected_date(context: Mapping[str, Any]) -> date:
     return utc_start.date()
 
 
+def _fault_injection_enabled() -> bool:
+    return os.getenv("DEMO_FAULT_INJECTION_ENABLED", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def _resolve_demo_delay_seconds(context: Mapping[str, Any]) -> float:
     params = context.get("params")
     raw_value = params.get("demo_delay_seconds", 0) if isinstance(params, Mapping) else 0
@@ -103,15 +111,31 @@ def _resolve_demo_delay_seconds(context: Mapping[str, Any]) -> float:
     if not 0 <= delay_seconds <= 60:
         raise ValueError("demo_delay_seconds must be between 0 and 60")
 
-    fault_injection_enabled = os.getenv(
-        "DEMO_FAULT_INJECTION_ENABLED", "false"
-    ).lower() in {"1", "true", "yes"}
-    if delay_seconds > 0 and not fault_injection_enabled:
+    if delay_seconds > 0 and not _fault_injection_enabled():
         raise ValueError(
             "demo_delay_seconds requires DEMO_FAULT_INJECTION_ENABLED=true"
         )
 
     return delay_seconds
+
+
+def _resolve_demo_fail_before_publish(
+    context: Mapping[str, Any],
+    try_number: int,
+) -> bool:
+    params = context.get("params")
+    raw_value = (
+        params.get("demo_fail_first_attempt", False)
+        if isinstance(params, Mapping)
+        else False
+    )
+    if not isinstance(raw_value, bool):
+        raise ValueError("demo_fail_first_attempt must be a boolean")
+    if raw_value and not _fault_injection_enabled():
+        raise ValueError(
+            "demo_fail_first_attempt requires DEMO_FAULT_INJECTION_ENABLED=true"
+        )
+    return raw_value and try_number == 1
 
 
 def _utc_isoformat(value: datetime | None) -> str | None:
@@ -174,6 +198,7 @@ def _publish_daily_aggregate(
     affected_date: date,
     *,
     demo_delay_seconds: float = 0,
+    demo_fail_before_publish: bool = False,
     hook: PostgresHook | None = None,
     progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -190,6 +215,9 @@ def _publish_daily_aggregate(
             cursor.execute(_SELECT_OLD_AGGREGATE_SQL, (affected_date,))
             old_aggregate = _serialize_aggregate(cursor.fetchone())
             attempt_progress["old_aggregate"] = old_aggregate
+
+            if demo_fail_before_publish:
+                raise RuntimeError("demo fail-first attempt before publication")
 
             cursor.execute(
                 _PUBLISH_DAILY_AGGREGATE_SQL,
@@ -304,10 +332,15 @@ def _run_daily_aggregate(
         affected_date = _resolve_affected_date(context)
         summary["affected_date"] = affected_date.isoformat()
         demo_delay_seconds = _resolve_demo_delay_seconds(context)
+        demo_fail_before_publish = _resolve_demo_fail_before_publish(
+            context,
+            try_number,
+        )
         summary.update(
             _publish_daily_aggregate(
                 affected_date,
                 demo_delay_seconds=demo_delay_seconds,
+                demo_fail_before_publish=demo_fail_before_publish,
                 hook=hook,
                 progress=progress,
             )
@@ -383,6 +416,15 @@ with DAG(
             description=(
                 "Local fault/concurrency probe delay before publication. "
                 "Rejected unless DEMO_FAULT_INJECTION_ENABLED=true."
+            ),
+        ),
+        "demo_fail_first_attempt": Param(
+            False,
+            type="boolean",
+            description=(
+                "Fail the first task attempt after reading the old aggregate but "
+                "before publication. Rejected unless "
+                "DEMO_FAULT_INJECTION_ENABLED=true."
             ),
         ),
     },

@@ -6,7 +6,7 @@
 
 ## Текущий статус
 
-Ручные, Asset-triggered и scheduled пересчёты работают; исправление D-01 подтверждено Pendulum regression test, реальным scheduled run и двухдневным backfill. Schema integration test повторяем на persistent БД после исправления D-02; открытым остаётся verification gap V-01. Актуальные результаты и ограничения находятся в [`docs/status.md`](docs/status.md).
+Ручные, Asset-triggered и scheduled пересчёты работают. D-01 и D-02 исправлены; Airflow-level acceptance suite закрывает V-01 и проверяет retry, ошибочный late-data пересчёт, сериализацию одной даты, параллельность разных дат, pool и фактический success XCom. AC-12 разрешает Airflow-specific состояния `scheduled` или `queued` для задачи, ожидающей pool slot, при доказанном лимите ёмкости. Актуальные результаты и ограничения находятся в [`docs/status.md`](docs/status.md).
 
 ## Требования
 
@@ -104,7 +104,7 @@ docker compose run --rm airflow-cli airflow dags trigger orders_daily_aggregate 
 
 Каждая попытка расчёта пишет одной JSON-записью операторскую сводку: дату и причину запуска, число прочитанных и выбранных заказов, старый и новый агрегаты, состояние публикации, ожидание блокировки, номер попытки и ошибку. Успешная сводка возвращается задачей как XCom `return_value`; при ошибке, включая timeout, JSON записывается до повторного возбуждения исключения, а старый агрегат остаётся опубликованным.
 
-Параметр `demo_delay_seconds` предназначен только для локальных concurrency/timeout probes. По умолчанию он отвергается; для явно тестового запуска stack нужно стартовать с `DEMO_FAULT_INJECTION_ENABLED=true`.
+Параметры `demo_delay_seconds` и `demo_fail_first_attempt` предназначены только для локальных acceptance/concurrency/timeout probes. Первый удерживает транзакцию перед публикацией, второй один раз завершает первую попытку после чтения старого агрегата, но до публикации. По умолчанию оба механизма отвергаются; для явно тестового запуска stack нужно стартовать с `DEMO_FAULT_INJECTION_ENABLED=true`.
 
 Локальные unit tests DAG:
 
@@ -132,6 +132,34 @@ docker run --rm --network airflow-orchestration_default \
   airflow-orchestration:3.1.6 \
   -q tests/integration/test_daily_aggregate_concurrency.py
 ```
+
+## Airflow-level acceptance suite (V-01)
+
+Acceptance suite использует реальный scheduler/Celery worker, Airflow API v2, Asset events, task logs, XCom и обе PostgreSQL-базы. Она проверяет AC-02, AC-07, AC-08, AC-09, AC-10 и AC-12. Для безопасных fault/concurrency probes Airflow-сервисы временно запускаются с явно включённой test-only инъекцией:
+
+```bash
+DEMO_FAULT_INJECTION_ENABLED=true \
+  docker compose up -d --wait --wait-timeout 300
+
+docker run --rm \
+  --network airflow-orchestration_default \
+  -e AIRFLOW_API_BASE_URL=http://airflow-apiserver:8080 \
+  -e AIRFLOW_API_USERNAME=airflow \
+  -e AIRFLOW_API_PASSWORD=airflow \
+  -e ORDERS_TEST_DSN=postgresql://airflow:airflow@postgres:5432/orders_demo \
+  -v "$PWD/tests:/opt/airflow/tests:ro" \
+  -w /opt/airflow \
+  --entrypoint pytest \
+  airflow-orchestration:3.1.6 \
+  -q tests/acceptance/test_airflow_v01.py
+
+# Вернуть обычный режим, взяв значение из .env/default false.
+docker compose up -d --wait --wait-timeout 300
+```
+
+Suite сохраняет исходные pause-состояния DAG. Для каждого запуска она выбирает незанятые даты в диапазоне 2200—2299 и уникальные `order_id`. Добавленные raw events намеренно не удаляются из append-only таблицы; существующие данные и PostgreSQL volume не очищаются.
+
+Для Airflow 3.1.6 задача, ожидающая освобождения pool, наблюдается в состоянии `scheduled`; уточнённый AC-12 также допускает `queued`. Проверка подтверждает контракт ёмкости через task states, timestamps и API pool: одновременно заняты не более двух слотов, третья задача стартует только после освобождения одного из них.
 
 ## Остановка
 

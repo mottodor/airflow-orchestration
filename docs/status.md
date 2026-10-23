@@ -2,18 +2,18 @@
 
 - **Нормативный контракт:** [`docs/spec.md`](spec.md)
 - **Исторический план:** [`docs/bootstrap.md`](bootstrap.md)
-- **Проверенный baseline реализации:** `3e0a519`
-- **Исправление D-02:** текущий review-ready diff, commit ещё не создан
+- **Проверенный baseline реализации:** `d1bc900`
+- **Работа по V-01:** текущий diff, commit ещё не создан
 - **Дата проверки:** 2026-10-23
-- **Общий статус:** `D-01_D-02_RESOLVED_V-01_OPEN`
+- **Общий статус:** `READY_FOR_ACCEPTANCE`
 
 Этот документ фиксирует изменяемое состояние реализации: фактически выполненные проверки, известные отклонения от утверждённой спецификации, пробелы в acceptance coverage и следующие действия. Он не изменяет требования из `docs/spec.md`.
 
 ## 1. Краткий итог
 
-Локальная среда, схема данных, ingestion, Asset-triggered dispatcher, ручной и scheduled дневной расчёт, двухдневный backfill, транзакционная публикация, advisory lock, timeout и структурированная сводка реализованы и в основном подтверждены тестами.
+Локальная среда, схема данных, ingestion, Asset-triggered dispatcher, ручной и scheduled дневной расчёт, двухдневный backfill, транзакционная публикация, advisory lock, timeout и структурированная сводка реализованы и подтверждены тестами.
 
-Блокирующий дефект D-01 исправлен и подтверждён реальными scheduled/backfill runs. D-02 также исправлен: schema integration test изолирует собственный fixture и повторяется на заполненной persistent БД. Открытым остаётся verification gap V-01 с несколькими Airflow-level acceptance-сценариями.
+D-01 и D-02 исправлены. Airflow-level acceptance suite закрыл V-01 для fail-first retry, ошибочного late-data target run, сериализации одной даты, параллельности разных дат, ограничения pool и чтения фактического success XCom. Пользователь явно уточнил AC-12: для ожидающей pool slot задачи разрешены Airflow-specific состояния `scheduled` или `queued` при доказанном лимите ёмкости.
 
 ## 2. Статус компонентов
 
@@ -28,10 +28,10 @@
 | Daily aggregate: scheduled/backfill | PASS | Pendulum regression test, реальный scheduled run и двухдневный backfill |
 | Latest-version/dedup/conflict SQL | PASS | Подтверждено SQL integration tests |
 | Advisory lock и rollback | PASS | Подтверждено PostgreSQL concurrency tests |
-| Pool `orders_compute` | PARTIAL | Настройка подтверждена; Airflow-level сценарий трёх задач не автоматизирован |
+| Pool `orders_compute` | PASS | Максимум 2 занятых слота, состояние ожидания `scheduled` и отложенный старт третьей задачи подтверждены Airflow API |
 | Execution timeout | PASS | Реальный timeout сохраняет старый результат |
 | Structured JSON summary | PASS | Success и failure/timeout paths подтверждены логами и unit tests |
-| Полный AC-01—AC-13 suite | PARTIAL | См. матрицу acceptance criteria |
+| Полный AC-01—AC-13 suite | PASS | SQL/unit/runtime evidence и Airflow-level V-01 suite закрывают матрицу acceptance criteria |
 | CI | NOT_IMPLEMENTED | Не входил в минимальный bootstrap scope |
 
 ## 3. Проверенная среда
@@ -68,7 +68,8 @@ Host LSP не разрешает импорты Airflow и `psycopg2`, пото�
 
 | Набор | Результат |
 |---|---|
-| `tests/unit` | PASS — 40 tests |
+| `tests/unit` | PASS — 47 tests |
+| `tests/acceptance/test_airflow_v01.py` | PASS — 5 Airflow-level scenarios |
 | `tests/integration/test_daily_aggregate.sql` | PASS |
 | `tests/integration/test_daily_aggregate_concurrency.py` | PASS — 3 tests |
 | `tests/integration/test_schema.sql` на чистой временной БД | PASS |
@@ -126,7 +127,7 @@ orders_ingestion
 - **Статус:** RESOLVED
 - **Компонент:** `dags/orders_daily_aggregate.py`, `tests/unit/test_orders_daily_aggregate.py`
 - **Затронутые критерии:** AC-01, AC-03 и обязательный backfill path
-- **Commit:** не создан; исправление находится в текущем review-ready diff
+- **Commit:** `3e564c6`
 
 #### Историческое поведение и причина
 
@@ -155,7 +156,7 @@ ValueError: the Airflow data interval must be one complete UTC day
 - **Severity:** MEDIUM
 - **Статус:** RESOLVED
 - **Компонент:** `tests/integration/test_schema.sql`, `README.md`
-- **Commit:** не создан; исправление находится в текущем review-ready diff
+- **Commit:** `d1bc900`
 
 #### Наблюдаемое поведение
 
@@ -182,20 +183,25 @@ Raw table append-only, поэтому ранее созданные строки
 ### V-01 — Не все критерии проверяются на уровне Airflow
 
 - **Тип:** Verification gap
+- **Статус:** RESOLVED
 - **Затронутые критерии:** AC-02, AC-07, AC-08, AC-09, AC-10, AC-12
+- **Компоненты:** `dags/orders_daily_aggregate.py`, `tests/acceptance/test_airflow_v01.py`, `tests/unit/test_orders_daily_aggregate.py`, `README.md`
+- **Commit:** не создан; закрытие находится в текущем review-ready diff
 
-Существующие unit и PostgreSQL integration tests подтверждают основные функции, но не полностью воспроизводят:
+Добавлен test-only параметр `demo_fail_first_attempt`, доступный только при `DEMO_FAULT_INJECTION_ENABLED=true`. Первая попытка получает advisory lock, читает старый агрегат и завершается до публикации; штатный retry того же Airflow run затем выполняет реальный расчёт. По умолчанию механизм отключён и отвергается, как и существующий `demo_delay_seconds`.
 
-- fail-first Airflow task с последующим успешным retry в том же run;
-- failed late-data target run со старым опубликованным агрегатом;
-- два конкурирующих Airflow runs одной даты, где второй после lock читает новый заказ;
-- перекрывающиеся Airflow runs разных дат;
-- три compute tasks при pool ёмкостью 2 с наблюдением queued/running states;
-- чтение и сравнение фактического success XCom через Airflow metadata/API.
+Автоматизированный acceptance suite через Airflow API v2 и реальный Celery stack подтверждает:
 
-#### Definition of Done
+- первая попытка переходит в `up_for_retry`, старый агрегат остаётся `1 / 10.00`, а вторая попытка публикует `2 / 17.00`;
+- success XCom `return_value` совпадает с JSON-сводкой финального task log и содержит `trigger_reason=retry`;
+- ingestion публикует Asset metadata, dispatcher получает тот же upstream event, а конфликтный late-data target run завершается `failed` и сохраняет старый агрегат;
+- два Airflow runs одной даты перекрываются по task timestamps, второй сообщает `lock_waited=true`, читает добавленный во время ожидания 11-й заказ и публикует `11 / 66.00`;
+- задачи разных дат реально перекрываются по времени и публикуют независимые результаты;
+- при трёх runs pool API показывает 2 running slots, 0 open slots и одну ожидающую задачу; третья стартует только после завершения одной из первых двух.
 
-Добавлен автоматизированный acceptance/e2e слой, который проверяет task/run states, timestamps, Asset metadata, XCom и независимо вычисленные SQL-результаты.
+Airflow 3.1.6 удерживает задачу, ожидающую pool slot, в состоянии `scheduled`. Пользователь явно уточнил AC-12 и разрешил Airflow-specific состояние `scheduled` или `queued` при доказанном лимите pool. Task timestamps и счётчики pool API подтверждают ограничение ёмкости: одновременно заняты ровно два слота, третья задача стартует только после освобождения одного из них.
+
+Suite выбирает незанятые даты 2200—2299 и уникальные `order_id`. Append-only raw fixtures намеренно не удаляются; existing persistent volume не очищался.
 
 ## 8. Принятый технический риск
 
@@ -220,24 +226,25 @@ Raw table append-only, поэтому ранее созданные строки
 | AC | Статус | Evidence / ограничение |
 |---|---|---|
 | AC-01 | PASS | Реальный scheduled run на независимом fixture R1–R4 опубликовал ровно `2 / 170.00` |
-| AC-02 | PARTIAL | rollback и сохранение старого результата подтверждены; нужен единый fail-then-success Airflow retry scenario |
+| AC-02 | PASS | Airflow run: первая попытка `up_for_retry` сохраняет старый `1 / 10.00`, retry публикует единственный `2 / 17.00` |
 | AC-03 | PASS | SQL-идемпотентность подтверждена ранее; реальный двухдневный Airflow backfill завершён успешно, по одной активной строке на дату |
 | AC-04 | PASS | Latest version и exact duplicate проверены |
 | AC-05 | PASS | Конфликт блокирует публикацию и сохраняет старый результат |
 | AC-06 | PASS | Реальный ingestion -> Asset -> dispatcher -> target run выполнен |
-| AC-07 | PARTIAL | Общий failure/rollback path работает; нужен failed late-data E2E |
-| AC-08 | PARTIAL | PostgreSQL serialization проверена; полный Airflow scenario не автоматизирован |
-| AC-09 | PARTIAL | PostgreSQL parallelism разных дат проверен; Airflow-level evidence отсутствует |
-| AC-10 | PARTIAL | JSON logs и task return проверены; фактический XCom lookup не автоматизирован |
+| AC-07 | PASS | Конфликтный ingestion -> Asset -> dispatcher -> target run завершается `failed`; старый `1 / 20.00` сохранён |
+| AC-08 | PASS | Два перекрывающихся Airflow runs одной даты; второй ждёт lock и публикует актуальные `11 / 66.00` |
+| AC-09 | PASS | Два delayed Airflow runs разных дат имеют перекрывающиеся task intervals и независимые результаты |
+| AC-10 | PASS | Success/failure JSON logs разобраны через API; success XCom `return_value` получен и сопоставлен с SQL и task state |
 | AC-11 | PASS | UTC boundary fixture проверен SQL integration test |
-| AC-12 | PARTIAL | Pool создан и task использует слот; сценарий трёх Airflow tasks не автоматизирован |
+| AC-12 | PASS | Три Airflow runs: pool API фиксирует 2 running, 0 open и ожидающий `scheduled` task; третий task стартует после освобождения слота |
 | AC-13 | PASS | Реальный timeout сохраняет старый агрегат и пишет JSON error summary |
 
 ## 10. Приоритет следующих изменений
 
-1. Добавить минимальный Airflow-level acceptance suite для V-01.
-2. После подтверждения всех обязательных режимов обновить AC-матрицу и общий статус.
-3. Отдельным решением очистить или пересоздать локальную metadata DB, если для демонстрации нужна история без старых failed runs.
+1. Провести финальный независимый review уточнённого AC-12 и текущего V-01 diff.
+2. Создать commit после решения пользователя.
+3. При необходимости добавить CI для unit/integration/acceptance уровней отдельной задачей.
+4. Отдельным решением очистить или пересоздать локальную metadata DB, если для демонстрации нужна история без старых failed runs.
 
 ## 11. Правила обновления документа
 
