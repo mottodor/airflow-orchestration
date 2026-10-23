@@ -3,9 +3,9 @@
 - **Нормативный контракт:** [`docs/spec.md`](spec.md)
 - **Исторический план:** [`docs/bootstrap.md`](bootstrap.md)
 - **Проверенный baseline реализации:** `3e0a519`
-- **Исправление D-01:** текущий review-ready diff, commit ещё не создан
+- **Исправление D-02:** текущий review-ready diff, commit ещё не создан
 - **Дата проверки:** 2026-10-23
-- **Общий статус:** `D-01_RESOLVED_OPEN_GAPS`
+- **Общий статус:** `D-01_D-02_RESOLVED_V-01_OPEN`
 
 Этот документ фиксирует изменяемое состояние реализации: фактически выполненные проверки, известные отклонения от утверждённой спецификации, пробелы в acceptance coverage и следующие действия. Он не изменяет требования из `docs/spec.md`.
 
@@ -13,7 +13,7 @@
 
 Локальная среда, схема данных, ingestion, Asset-triggered dispatcher, ручной и scheduled дневной расчёт, двухдневный backfill, транзакционная публикация, advisory lock, timeout и структурированная сводка реализованы и в основном подтверждены тестами.
 
-Блокирующий дефект D-01 исправлен и подтверждён реальными scheduled/backfill runs. Первый срез всё ещё имеет открытые gaps: требуется сделать schema integration test повторяемым на persistent environment и закрыть несколько Airflow-level acceptance-сценариев.
+Блокирующий дефект D-01 исправлен и подтверждён реальными scheduled/backfill runs. D-02 также исправлен: schema integration test изолирует собственный fixture и повторяется на заполненной persistent БД. Открытым остаётся verification gap V-01 с несколькими Airflow-level acceptance-сценариями.
 
 ## 2. Статус компонентов
 
@@ -21,7 +21,7 @@
 |---|---|---|
 | Version-pinned Docker Compose | PASS | Airflow 3.1.6, PostgreSQL 16, Redis 7.2 |
 | Airflow services и health checks | PASS | Все обязательные сервисы запускались в healthy-состоянии |
-| SQL schema | PASS | Идемпотентное применение подтверждено |
+| SQL schema | PASS | Идемпотентное применение и повторяемый integration test на persistent БД подтверждены |
 | Append-only ingestion DAG | PASS | Валидация, PostgreSQL insert и Asset metadata работают |
 | Late-data dispatcher | PASS | Дедупликация дат и целевой `TriggerDagRunOperator` работают |
 | Daily aggregate: manual/late-data | PASS | Реальный целевой запуск успешно публикует агрегат |
@@ -72,9 +72,8 @@ Host LSP не разрешает импорты Airflow и `psycopg2`, пото�
 | `tests/integration/test_daily_aggregate.sql` | PASS |
 | `tests/integration/test_daily_aggregate_concurrency.py` | PASS — 3 tests |
 | `tests/integration/test_schema.sql` на чистой временной БД | PASS |
+| `tests/integration/test_schema.sql` два раза подряд на заполненной persistent `orders_demo` | PASS |
 | Повторное применение `sql/001_create_orders_schema.sql` | PASS |
-
-`tests/integration/test_schema.sql` на заполненной persistent `orders_demo` завершается ошибкой из-за D-02; это не ошибка самой схемы.
 
 ### 4.2 Реальный Asset E2E
 
@@ -154,7 +153,9 @@ ValueError: the Airflow data interval must be one complete UTC day
 ### D-02 — Schema integration test зависит от пустой БД
 
 - **Severity:** MEDIUM
-- **Компонент:** `tests/integration/test_schema.sql:69`
+- **Статус:** RESOLVED
+- **Компонент:** `tests/integration/test_schema.sql`, `README.md`
+- **Commit:** не создан; исправление находится в текущем review-ready diff
 
 #### Наблюдаемое поведение
 
@@ -166,19 +167,15 @@ IF (SELECT count(*) FROM orders_demo.raw_order_events) <> 4 THEN
 
 Raw table append-only, поэтому ранее созданные строки нельзя штатно удалить перед повторным запуском теста.
 
-#### Требуемое исправление
+#### Исправление
 
-Предпочтительный вариант:
+Тест создаёт транзакционный fixture с уникальным префиксом `order_id`, проверяет только принадлежащие ему append-only события и динамически выбирает две незанятые даты для строк агрегатов. Обёртка `BEGIN ... ROLLBACK` сохранена, поэтому fixture не остаётся в persistent БД и не требует удаления пользовательских данных.
 
-- использовать уникальный префикс fixture;
-- считать и проверять только строки этого fixture;
-- сохранить обёртку `BEGIN ... ROLLBACK`.
+#### Проверки
 
-Альтернативный вариант — создавать отдельную временную test database и явно документировать этот интерфейс.
-
-#### Definition of Done
-
-Одна и та же документированная команда schema integration test успешно выполняется два раза подряд без удаления PostgreSQL volume и пользовательских данных.
+- прежняя реализация воспроизвела D-02 на заполненной `orders_demo`: ожидаемый `raw table did not preserve all four append-only events`;
+- одна и та же документированная команда schema integration test выполнена два раза подряд: PASS / PASS;
+- PostgreSQL volume не удалялся, существующий Compose stack оставался запущенным.
 
 ## 7. Verification gaps
 
@@ -238,10 +235,9 @@ Raw table append-only, поэтому ранее созданные строки
 
 ## 10. Приоритет следующих изменений
 
-1. Исправить D-02 и сделать документированную schema test command повторяемой.
-2. Добавить минимальный Airflow-level acceptance suite для V-01.
-3. После подтверждения всех обязательных режимов обновить AC-матрицу и общий статус.
-4. Отдельным решением очистить или пересоздать локальную metadata DB, если для демонстрации нужна история без старых failed runs.
+1. Добавить минимальный Airflow-level acceptance suite для V-01.
+2. После подтверждения всех обязательных режимов обновить AC-матрицу и общий статус.
+3. Отдельным решением очистить или пересоздать локальную metadata DB, если для демонстрации нужна история без старых failed runs.
 
 ## 11. Правила обновления документа
 

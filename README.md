@@ -6,7 +6,7 @@
 
 ## Текущий статус
 
-Ручные, Asset-triggered и scheduled пересчёты работают; исправление D-01 подтверждено Pendulum regression test, реальным scheduled run и двухдневным backfill. Первый срез сохраняет открытые gaps D-02 и V-01; актуальные результаты и ограничения находятся в [`docs/status.md`](docs/status.md).
+Ручные, Asset-triggered и scheduled пересчёты работают; исправление D-01 подтверждено Pendulum regression test, реальным scheduled run и двухдневным backfill. Schema integration test повторяем на persistent БД после исправления D-02; открытым остаётся verification gap V-01. Актуальные результаты и ограничения находятся в [`docs/status.md`](docs/status.md).
 
 ## Требования
 
@@ -46,9 +46,7 @@ docker compose exec -T postgres \
   < tests/integration/test_schema.sql
 ```
 
-Повторное применение схемы намеренно проверяется: миграция должна оставаться идемпотентной.
-
-`tests/integration/test_schema.sql` сейчас предполагает чистую тестовую БД. На заполненной persistent `orders_demo` он может завершиться ошибкой из-за ранее сохранённых append-only событий; это известное ограничение D-02 из [`docs/status.md`](docs/status.md), а не признак повреждения схемы.
+Повторное применение схемы намеренно проверяется: миграция должна оставаться идемпотентной. Schema integration test использует fixture с уникальным префиксом, выбирает незанятые даты агрегатов и откатывает транзакцию, поэтому эту же команду можно повторять на заполненной persistent `orders_demo` без удаления пользовательских данных.
 
 ## Приём изменений заказов
 
