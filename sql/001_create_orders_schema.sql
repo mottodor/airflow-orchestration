@@ -82,8 +82,11 @@ CREATE TABLE IF NOT EXISTS orders_demo.daily_order_aggregates (
 COMMENT ON TABLE orders_demo.daily_order_aggregates IS
     'Currently published daily aggregates; aggregate_date is the single active result key.';
 
+DROP FUNCTION IF EXISTS orders_demo.publish_daily_order_aggregate(date);
+
 CREATE OR REPLACE FUNCTION orders_demo.publish_daily_order_aggregate(
-    p_aggregate_date date
+    p_aggregate_date date,
+    p_delay_before_publish_seconds double precision DEFAULT 0
 )
 RETURNS TABLE (
     records_read bigint,
@@ -107,6 +110,20 @@ BEGIN
         RAISE EXCEPTION 'aggregate date must be finite and non-null'
             USING ERRCODE = '22007';
     END IF;
+
+    IF p_delay_before_publish_seconds IS NULL
+       OR p_delay_before_publish_seconds < 0
+       OR p_delay_before_publish_seconds > 60 THEN
+        RAISE EXCEPTION 'delay before publish must be between 0 and 60 seconds'
+            USING ERRCODE = '22023';
+    END IF;
+
+    -- The two-key namespace is stable and independent from Python hash randomization.
+    -- Transaction-level ownership is released by commit, rollback, or connection loss.
+    PERFORM pg_advisory_xact_lock(
+        20250301,
+        p_aggregate_date - DATE '0001-01-01' + 1
+    );
 
     WITH target_order_ids AS (
         SELECT DISTINCT order_id
@@ -191,6 +208,9 @@ BEGIN
         v_source_max_updated_at
     FROM latest_versions;
 
+    -- Used only by explicitly enabled local fault/concurrency probes. The sleep is
+    -- deliberately before UPSERT so cancellation cannot expose a partial result.
+    PERFORM pg_sleep(p_delay_before_publish_seconds);
     v_published_at := clock_timestamp();
 
     INSERT INTO orders_demo.daily_order_aggregates (
@@ -224,7 +244,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION orders_demo.publish_daily_order_aggregate(date) IS
-    'Validates order versions, selects the latest version per order, and atomically upserts one UTC day.';
+COMMENT ON FUNCTION orders_demo.publish_daily_order_aggregate(date, double precision) IS
+    'Serializes one UTC date, validates versions, and atomically upserts only after optional local probe delay.';
 
 COMMIT;

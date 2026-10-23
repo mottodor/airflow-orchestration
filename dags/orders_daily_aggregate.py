@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+import os
 from typing import Any, Mapping
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -12,6 +13,9 @@ from airflow.timetables.interval import CronDataIntervalTimetable
 from airflow.utils.types import DagRunType
 
 ORDERS_DB_CONN_ID = "orders_db"
+ORDERS_COMPUTE_POOL = "orders_compute"
+EXECUTION_TIMEOUT = timedelta(seconds=10)
+RETRY_DELAY = timedelta(seconds=5)
 
 _PUBLISH_DAILY_AGGREGATE_SQL = """
 SELECT
@@ -20,7 +24,7 @@ SELECT
     sales_amount,
     published_at,
     source_max_updated_at
-FROM orders_demo.publish_daily_order_aggregate(%s)
+FROM orders_demo.publish_daily_order_aggregate(%s, %s)
 """
 
 
@@ -70,6 +74,27 @@ def _resolve_affected_date(context: Mapping[str, Any]) -> date:
     return utc_start.date()
 
 
+def _resolve_demo_delay_seconds(context: Mapping[str, Any]) -> float:
+    params = context.get("params")
+    raw_value = params.get("demo_delay_seconds", 0) if isinstance(params, Mapping) else 0
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+        raise ValueError("demo_delay_seconds must be a number")
+
+    delay_seconds = float(raw_value)
+    if not 0 <= delay_seconds <= 60:
+        raise ValueError("demo_delay_seconds must be between 0 and 60")
+
+    fault_injection_enabled = os.getenv(
+        "DEMO_FAULT_INJECTION_ENABLED", "false"
+    ).lower() in {"1", "true", "yes"}
+    if delay_seconds > 0 and not fault_injection_enabled:
+        raise ValueError(
+            "demo_delay_seconds requires DEMO_FAULT_INJECTION_ENABLED=true"
+        )
+
+    return delay_seconds
+
+
 def _utc_isoformat(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -81,12 +106,16 @@ def _utc_isoformat(value: datetime | None) -> str | None:
 def _publish_daily_aggregate(
     affected_date: date,
     *,
+    demo_delay_seconds: float = 0,
     hook: PostgresHook | None = None,
 ) -> dict[str, Any]:
     connection = (hook or PostgresHook(postgres_conn_id=ORDERS_DB_CONN_ID)).get_conn()
     try:
         with connection.cursor() as cursor:
-            cursor.execute(_PUBLISH_DAILY_AGGREGATE_SQL, (affected_date,))
+            cursor.execute(
+                _PUBLISH_DAILY_AGGREGATE_SQL,
+                (affected_date, demo_delay_seconds),
+            )
             row = cursor.fetchone()
             if row is None:
                 raise RuntimeError("daily aggregate publication returned no result")
@@ -128,14 +157,35 @@ with DAG(
                 "Optional target UTC date for a manual or delegated run. "
                 "Scheduled and backfill runs use their data interval by default."
             ),
-        )
+        ),
+        "demo_delay_seconds": Param(
+            0,
+            type="number",
+            minimum=0,
+            maximum=60,
+            description=(
+                "Local fault/concurrency probe delay before publication. "
+                "Rejected unless DEMO_FAULT_INJECTION_ENABLED=true."
+            ),
+        ),
     },
     tags=["orders", "daily-aggregate"],
 ) as dag:
 
-    @task
+    @task(
+        pool=ORDERS_COMPUTE_POOL,
+        pool_slots=1,
+        execution_timeout=EXECUTION_TIMEOUT,
+        retries=1,
+        retry_delay=RETRY_DELAY,
+    )
     def calculate_daily_aggregate() -> dict[str, Any]:
-        affected_date = _resolve_affected_date(get_current_context())
-        return _publish_daily_aggregate(affected_date)
+        context = get_current_context()
+        affected_date = _resolve_affected_date(context)
+        demo_delay_seconds = _resolve_demo_delay_seconds(context)
+        return _publish_daily_aggregate(
+            affected_date,
+            demo_delay_seconds=demo_delay_seconds,
+        )
 
     calculate_daily_aggregate()

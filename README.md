@@ -82,6 +82,10 @@ docker compose run --rm airflow-cli airflow dags trigger orders_daily_aggregate 
 
 Расчёт выбирает для каждого `order_id` версию с максимальным `updated_at`, а точные бизнес-копии (различающиеся только `ingested_at`) учитывает один раз. Разные записи с одинаковыми `order_id` и `updated_at`, а также попытка изменить `order_ts` устойчивого заказа, завершают расчёт ошибкой до публикации.
 
+`airflow-init` создаёт pool `orders_compute` на 2 слота. Задача расчёта занимает 1 слот, имеет `execution_timeout=10` секунд, один retry через 5 секунд и берёт transaction-level PostgreSQL advisory lock по дате до чтения входа. Поэтому одна дата сериализуется, а разные даты могут вычисляться параллельно.
+
+Параметр `demo_delay_seconds` предназначен только для локальных concurrency/timeout probes. По умолчанию он отвергается; для явно тестового запуска stack нужно стартовать с `DEMO_FAULT_INJECTION_ENABLED=true`.
+
 Локальные unit tests DAG:
 
 ```bash
@@ -93,12 +97,20 @@ docker run --rm --entrypoint pytest \
   -q tests/unit
 ```
 
-После применения схемы integration-проверка дневного расчёта запускается так:
+После применения схемы integration-проверки дневного расчёта запускаются так:
 
 ```bash
 docker compose exec -T postgres \
   psql -v ON_ERROR_STOP=1 -U airflow -d orders_demo \
   < tests/integration/test_daily_aggregate.sql
+
+docker run --rm --network airflow-orchestration_default \
+  -e ORDERS_TEST_DSN=postgresql://airflow:airflow@postgres:5432/orders_demo \
+  -v "$PWD/tests:/opt/airflow/tests:ro" \
+  -w /opt/airflow \
+  --entrypoint pytest \
+  airflow-orchestration:3.1.6 \
+  -q tests/integration/test_daily_aggregate_concurrency.py
 ```
 
 ## Остановка

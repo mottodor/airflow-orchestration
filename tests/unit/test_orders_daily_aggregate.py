@@ -160,8 +160,8 @@ def test_publish_commits_one_parameterized_function_call() -> None:
 
     assert len(connection.cursor_instance.executions) == 1
     sql, parameters = connection.cursor_instance.executions[0]
-    assert "orders_demo.publish_daily_order_aggregate(%s)" in sql
-    assert parameters == (date(2025, 3, 1),)
+    assert "orders_demo.publish_daily_order_aggregate(%s, %s)" in sql
+    assert parameters == (date(2025, 3, 1), 0)
     assert connection.commits == 1
     assert connection.rollbacks == 0
     assert connection.closes == 1
@@ -173,6 +173,63 @@ def test_publish_commits_one_parameterized_function_call() -> None:
         "published_at": "2025-03-02T00:00:00Z",
         "source_max_updated_at": "2025-03-01T12:00:00Z",
     }
+
+
+def test_demo_delay_is_rejected_unless_local_fault_injection_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DEMO_FAULT_INJECTION_ENABLED", raising=False)
+
+    with pytest.raises(ValueError, match="requires DEMO_FAULT_INJECTION_ENABLED"):
+        orders_daily_aggregate._resolve_demo_delay_seconds(
+            {"params": {"demo_delay_seconds": 1}}
+        )
+
+
+def test_demo_delay_is_available_for_explicit_local_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEMO_FAULT_INJECTION_ENABLED", "true")
+
+    assert orders_daily_aggregate._resolve_demo_delay_seconds(
+        {"params": {"demo_delay_seconds": 1.5}}
+    ) == 1.5
+
+
+@pytest.mark.parametrize("value", [True, "1", -1, 61])
+def test_invalid_demo_delay_is_rejected(
+    value: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEMO_FAULT_INJECTION_ENABLED", "true")
+
+    with pytest.raises(ValueError, match="demo_delay_seconds"):
+        orders_daily_aggregate._resolve_demo_delay_seconds(
+            {"params": {"demo_delay_seconds": value}}
+        )
+
+
+def test_publish_passes_the_probe_delay_to_the_transactional_function() -> None:
+    connection = FakeConnection(
+        (
+            0,
+            0,
+            Decimal("0.00"),
+            datetime(2025, 3, 2, 0, 0, tzinfo=timezone.utc),
+            None,
+        )
+    )
+
+    orders_daily_aggregate._publish_daily_aggregate(
+        date(2025, 3, 1),
+        demo_delay_seconds=2.5,
+        hook=FakeHook(connection),
+    )
+
+    assert connection.cursor_instance.executions[0][1] == (
+        date(2025, 3, 1),
+        2.5,
+    )
 
 
 def test_publish_rolls_back_and_closes_on_database_failure() -> None:
@@ -212,6 +269,13 @@ def test_dag_has_the_daily_utc_data_interval_contract() -> None:
     assert dag.start_date == datetime(2025, 3, 1, tzinfo=timezone.utc)
     assert isinstance(dag.timetable, CronDataIntervalTimetable)
     assert dag.timetable.summary == "0 0 * * *"
+
+    task = dag.task_dict["calculate_daily_aggregate"]
+    assert task.pool == "orders_compute"
+    assert task.pool_slots == 1
+    assert task.execution_timeout.total_seconds() == 10
+    assert task.retries == 1
+    assert task.retry_delay.total_seconds() == 5
 
     first_run = dag.timetable.next_dagrun_info(
         last_automated_data_interval=None,
