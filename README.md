@@ -46,7 +46,7 @@ docker compose exec -T postgres \
 
 ## Приём изменений заказов
 
-DAG `orders_ingestion` запускается вручную и принимает непустой `change_id`, причину изменения и массив append-only версий заказов. Все события одного запуска должны относиться ровно к одной календарной UTC-дате. После успешной записи DAG публикует Asset event таблицы `orders_demo.raw_order_events` с metadata `affected_date`, `reason` и `change_id`.
+DAG `orders_ingestion` запускается вручную и принимает непустой `change_id`, причину изменения и массив append-only версий заказов. Все события одного запуска должны относиться ровно к одной календарной UTC-дате. После успешной записи DAG публикует Asset event таблицы `orders_demo.raw_order_events` с metadata `affected_date`, `reason` и `change_id`. Asset-triggered DAG `orders_late_data_dispatcher` группирует накопленные события по `affected_date` и создаёт по одному целевому запуску `orders_daily_aggregate` на уникальную дату.
 
 Пример запуска:
 
@@ -66,6 +66,20 @@ docker compose run --rm airflow-cli airflow dags trigger orders_ingestion \
       "ingested_at": "2025-03-03T09:01:00Z"
     }]
   }'
+```
+
+## Диспетчер поздних данных
+
+`orders_late_data_dispatcher` использует официальный `TriggerDagRunOperator`. Для каждой уникальной даты в одном Asset-triggered запуске он формирует конфигурацию с `affected_date`, причиной `late_data` и исходными `change_id`/причинами. Повторы одной даты в наборе triggering events схлопываются.
+
+Run ID целевого запуска имеет вид `late_data__YYYY-MM-DD__<source-token>`, где `source-token` детерминированно вычисляется из run ID диспетчера. Поэтому retry диспетчера не создаёт второй логический запуск (`skip_when_already_exists=True`), а новое независимое обновление той же даты может создать новый пересчёт.
+
+Перед локальным экспериментом снимите паузу со всех трёх DAG:
+
+```bash
+docker compose run --rm airflow-cli airflow dags unpause orders_ingestion
+docker compose run --rm airflow-cli airflow dags unpause orders_late_data_dispatcher
+docker compose run --rm airflow-cli airflow dags unpause orders_daily_aggregate
 ```
 
 ## Дневной агрегат
