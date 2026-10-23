@@ -100,16 +100,88 @@ DECLARE
     v_sales_amount numeric;
     v_published_at timestamp with time zone;
     v_source_max_updated_at timestamp with time zone;
-    v_repeated_order_id text;
+    v_conflicting_order_id text;
+    v_conflicting_updated_at timestamp with time zone;
 BEGIN
     IF p_aggregate_date IS NULL OR NOT isfinite(p_aggregate_date) THEN
         RAISE EXCEPTION 'aggregate date must be finite and non-null'
             USING ERRCODE = '22007';
     END IF;
 
+    WITH target_order_ids AS (
+        SELECT DISTINCT order_id
+        FROM orders_demo.raw_order_events
+        WHERE order_ts >= (p_aggregate_date::timestamp AT TIME ZONE 'UTC')
+          AND order_ts < ((p_aggregate_date + 1)::timestamp AT TIME ZONE 'UTC')
+    ),
+    distinct_order_timestamps AS (
+        SELECT DISTINCT raw.order_id, raw.order_ts
+        FROM orders_demo.raw_order_events AS raw
+        INNER JOIN target_order_ids AS target USING (order_id)
+    )
+    SELECT order_id
+    INTO v_conflicting_order_id
+    FROM distinct_order_timestamps
+    GROUP BY order_id
+    HAVING count(*) > 1
+    ORDER BY order_id
+    LIMIT 1;
+
+    IF FOUND THEN
+        RAISE EXCEPTION 'order_id % has conflicting order_ts values',
+            v_conflicting_order_id;
+    END IF;
+
+    WITH target_order_ids AS (
+        SELECT DISTINCT order_id
+        FROM orders_demo.raw_order_events
+        WHERE order_ts >= (p_aggregate_date::timestamp AT TIME ZONE 'UTC')
+          AND order_ts < ((p_aggregate_date + 1)::timestamp AT TIME ZONE 'UTC')
+    ),
+    distinct_business_versions AS (
+        SELECT DISTINCT
+            raw.order_id,
+            raw.updated_at,
+            raw.order_ts,
+            raw.amount
+        FROM orders_demo.raw_order_events AS raw
+        INNER JOIN target_order_ids AS target USING (order_id)
+    )
+    SELECT order_id, updated_at
+    INTO v_conflicting_order_id, v_conflicting_updated_at
+    FROM distinct_business_versions
+    GROUP BY order_id, updated_at
+    HAVING count(*) > 1
+    ORDER BY order_id, updated_at
+    LIMIT 1;
+
+    IF FOUND THEN
+        RAISE EXCEPTION 'order_id % has conflicting records at updated_at %',
+            v_conflicting_order_id,
+            v_conflicting_updated_at;
+    END IF;
+
+    WITH raw_day AS (
+        SELECT order_id, order_ts, amount, updated_at
+        FROM orders_demo.raw_order_events
+        WHERE order_ts >= (p_aggregate_date::timestamp AT TIME ZONE 'UTC')
+          AND order_ts < ((p_aggregate_date + 1)::timestamp AT TIME ZONE 'UTC')
+    ),
+    deduplicated_versions AS (
+        SELECT DISTINCT order_id, order_ts, amount, updated_at
+        FROM raw_day
+    ),
+    latest_versions AS (
+        SELECT DISTINCT ON (order_id)
+            order_id,
+            amount,
+            updated_at
+        FROM deduplicated_versions
+        ORDER BY order_id, updated_at DESC
+    )
     SELECT
+        (SELECT count(*) FROM raw_day),
         count(*),
-        count(DISTINCT order_id),
         COALESCE(sum(amount), 0),
         max(updated_at)
     INTO
@@ -117,24 +189,7 @@ BEGIN
         v_order_count,
         v_sales_amount,
         v_source_max_updated_at
-    FROM orders_demo.raw_order_events
-    WHERE order_ts >= (p_aggregate_date::timestamp AT TIME ZONE 'UTC')
-      AND order_ts < ((p_aggregate_date + 1)::timestamp AT TIME ZONE 'UTC');
-
-    IF v_records_read <> v_order_count THEN
-        SELECT order_id
-        INTO v_repeated_order_id
-        FROM orders_demo.raw_order_events
-        WHERE order_ts >= (p_aggregate_date::timestamp AT TIME ZONE 'UTC')
-          AND order_ts < ((p_aggregate_date + 1)::timestamp AT TIME ZONE 'UTC')
-        GROUP BY order_id
-        HAVING count(*) > 1
-        ORDER BY order_id
-        LIMIT 1;
-
-        RAISE EXCEPTION 'raw input contains multiple records for order_id %',
-            v_repeated_order_id;
-    END IF;
+    FROM latest_versions;
 
     v_published_at := clock_timestamp();
 
@@ -170,6 +225,6 @@ END;
 $$;
 
 COMMENT ON FUNCTION orders_demo.publish_daily_order_aggregate(date) IS
-    'Calculates and atomically upserts one UTC day. Version resolution is added separately.';
+    'Validates order versions, selects the latest version per order, and atomically upserts one UTC day.';
 
 COMMIT;
