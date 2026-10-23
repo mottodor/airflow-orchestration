@@ -1,62 +1,76 @@
 # Airflow orchestration and safe backfills
 
-Учебный локальный проект на Apache Airflow 3.1.6. Контракт поведения находится в [`docs/spec.md`](docs/spec.md), исторический план реализации — в [`docs/bootstrap.md`](docs/bootstrap.md), фактический статус и известные отклонения — в [`docs/status.md`](docs/status.md).
+A local Apache Airflow 3.1.6 learning project that demonstrates safe retries, backfills, late-data recalculation, timeouts, and concurrent execution.
 
-> Docker Compose предназначен только для локальной разработки и обучения, не для production.
+The example workflow ingests versioned orders and publishes one daily aggregate with the order count and total sales amount for each UTC date.
 
-## Текущий статус
+> [!WARNING]
+> This Docker Compose environment is intended for local development and learning only. It is not a production deployment.
 
-Ручные, Asset-triggered и scheduled пересчёты работают. D-01 и D-02 исправлены; Airflow-level acceptance suite закрывает V-01 и проверяет retry, ошибочный late-data пересчёт, сериализацию одной даты, параллельность разных дат, pool и фактический success XCom. AC-12 разрешает Airflow-specific состояния `scheduled` или `queued` для задачи, ожидающей pool slot, при доказанном лимите ёмкости. Актуальные результаты и ограничения находятся в [`docs/status.md`](docs/status.md).
+## Architecture
 
-## Требования
+```text
+orders_ingestion
+  -> raw_order_events Asset
+  -> orders_late_data_dispatcher
+  -> orders_daily_aggregate
+  -> daily_order_aggregates
+```
 
-- Docker с Compose;
-- не менее 4 GiB памяти для Docker;
-- свободный порт `8080` либо другой `AIRFLOW_API_PORT` в `.env`.
+- `orders_ingestion` stores idempotent, append-only order changes and publishes an Airflow Asset event.
+- `orders_late_data_dispatcher` groups Asset events by affected date and starts targeted recalculations.
+- `orders_daily_aggregate` runs on a schedule, manually, or through backfill and atomically publishes one aggregate per date.
 
-## Первый запуск
+Manual, scheduled, backfill, and Asset-triggered workflows are implemented. The automated test suites cover acceptance criteria AC-01 through AC-13.
+
+## Prerequisites
+
+- Docker with Docker Compose;
+- at least 4 GiB of memory available to Docker;
+- port `8080` available, or a different `AIRFLOW_API_PORT` configured in `.env`.
+
+## Quick start
+
+Create the local environment file:
 
 ```bash
 cp .env.example .env
-# На Linux/WSL замените AIRFLOW_UID в .env результатом команды: id -u
+```
 
+On Linux or WSL, set `AIRFLOW_UID` in `.env` to the output of `id -u`.
+
+Build and start the stack:
+
+```bash
 docker compose config --quiet
 docker compose build
 docker compose up airflow-init
 docker compose up -d --wait --wait-timeout 300
-```
-
-Airflow UI по умолчанию: <http://localhost:8080>. Если `AIRFLOW_API_PORT` изменён, используйте `http://localhost:<AIRFLOW_API_PORT>`. Локальные учётные данные по умолчанию: `airflow` / `airflow`.
-
-## Проверка среды и схемы
-
-```bash
 docker compose ps
-docker compose run --rm airflow-cli airflow version
-docker compose run --rm airflow-cli airflow connections get orders_db
-docker compose run --rm airflow-cli python -c \
-  'import airflow, pytest; from importlib.metadata import version; assert airflow.__version__ == "3.1.6"; assert pytest.__version__ == "8.4.2"; assert version("apache-airflow-providers-postgres") == "6.5.1"; print("image versions: ok")'
-
-docker compose exec -T postgres \
-  psql -v ON_ERROR_STOP=1 -U airflow -d orders_demo \
-  < sql/001_create_orders_schema.sql
-
-docker compose exec -T postgres \
-  psql -v ON_ERROR_STOP=1 -U airflow -d orders_demo \
-  < tests/integration/test_schema.sql
 ```
 
-Повторное применение схемы намеренно проверяется: миграция должна оставаться идемпотентной. Schema integration test использует fixture с уникальным префиксом, выбирает незанятые даты агрегатов и откатывает транзакцию, поэтому эту же команду можно повторять на заполненной persistent `orders_demo` без удаления пользовательских данных.
+Open <http://localhost:8080> and sign in with the default local credentials:
 
-## Приём изменений заказов
+```text
+Username: airflow
+Password: airflow
+```
 
-DAG `orders_ingestion` запускается вручную и принимает непустой `change_id`, причину изменения и массив append-only версий заказов. Все события одного запуска должны относиться ровно к одной календарной UTC-дате. Запись raw events и immutable receipt для `change_id` выполняются одной PostgreSQL-транзакцией. Повтор того же `change_id` с тем же нормализованным содержимым не добавляет raw events повторно, но успешно публикует Asset event; повтор с другим содержимым завершается ошибкой. Ingestion task имеет один retry через 5 секунд, поэтому transient-сбой после commit и до регистрации Asset event восстанавливается без дублирования входа. После успешной попытки DAG публикует Asset event таблицы `orders_demo.raw_order_events` с metadata `affected_date`, `reason` и `change_id`. Asset-triggered DAG `orders_late_data_dispatcher` группирует накопленные события по `affected_date` и создаёт по одному целевому запуску `orders_daily_aggregate` на уникальную дату.
+If `AIRFLOW_API_PORT` was changed, use `http://localhost:<AIRFLOW_API_PORT>` instead.
 
-Пример запуска:
+## Run the example
+
+All DAGs are paused when first created. Unpause the project DAGs:
 
 ```bash
 docker compose run --rm airflow-cli airflow dags unpause orders_ingestion
+docker compose run --rm airflow-cli airflow dags unpause orders_late_data_dispatcher
+docker compose run --rm airflow-cli airflow dags unpause orders_daily_aggregate
+```
 
+Trigger ingestion with one late order:
+
+```bash
 docker compose run --rm airflow-cli airflow dags trigger orders_ingestion \
   --run-id example-late-order-2025-03-03 \
   --conf '{
@@ -72,101 +86,56 @@ docker compose run --rm airflow-cli airflow dags trigger orders_ingestion \
   }'
 ```
 
-## Диспетчер поздних данных
+This starts the complete workflow: ingestion publishes an Asset event, the dispatcher creates a targeted run, and the daily DAG recalculates `2025-03-01`.
 
-`orders_late_data_dispatcher` использует официальный `TriggerDagRunOperator`. Для каждой уникальной даты в одном Asset-triggered запуске он формирует конфигурацию с `affected_date`, причиной `late_data` и исходными `change_id`/причинами. Повторы одной даты в наборе triggering events схлопываются.
+Use the Airflow UI to inspect DAG runs, task states, logs, and the successful task's XCom value.
 
-Run ID целевого запуска имеет вид `late_data__YYYY-MM-DD__<source-token>`, где `source-token` детерминированно вычисляется из run ID диспетчера. Поэтому retry диспетчера не создаёт второй логический запуск (`skip_when_already_exists=True`), а новое независимое обновление той же даты может создать новый пересчёт.
-
-Перед локальным экспериментом снимите паузу со всех трёх DAG:
+To run the daily aggregate directly:
 
 ```bash
-docker compose run --rm airflow-cli airflow dags unpause orders_ingestion
-docker compose run --rm airflow-cli airflow dags unpause orders_late_data_dispatcher
-docker compose run --rm airflow-cli airflow dags unpause orders_daily_aggregate
-```
-
-## Дневной агрегат
-
-DAG `orders_daily_aggregate` работает по дневному UTC-расписанию. Scheduled/backfill run берёт дату из своего data interval; для ручного целевого запуска требуется параметр `affected_date` в формате `YYYY-MM-DD`. Расчёт и `UPSERT` одной активной строки даты выполняются в одной PostgreSQL-транзакции.
-
-```bash
-docker compose run --rm airflow-cli airflow dags unpause orders_daily_aggregate
-
 docker compose run --rm airflow-cli airflow dags trigger orders_daily_aggregate \
   --run-id example-daily-2025-03-01 \
   --conf '{"affected_date": "2025-03-01"}'
 ```
 
-Расчёт выбирает для каждого `order_id` версию с максимальным `updated_at`, а точные бизнес-копии (различающиеся только `ingested_at`) учитывает один раз. Разные записи с одинаковыми `order_id` и `updated_at`, а также попытка изменить `order_ts` устойчивого заказа, завершают расчёт ошибкой до публикации.
+## Safety guarantees
 
-`airflow-init` создаёт pool `orders_compute` на 2 слота. Задача расчёта занимает 1 слот, имеет `execution_timeout=10` секунд, один retry через 5 секунд и берёт transaction-level PostgreSQL advisory lock по дате до чтения входа. Поэтому одна дата сериализуется, а разные даты могут вычисляться параллельно.
+- Ingestion is idempotent by `change_id`; conflicting reuse of an ID fails.
+- Exact order-version duplicates are counted once, while conflicting versions fail before publication.
+- Aggregate calculation and publication run in one PostgreSQL transaction.
+- Failures, retries, and timeouts preserve the previously published aggregate.
+- PostgreSQL advisory locks serialize calculations for the same date.
+- Different dates can run in parallel.
+- The `orders_compute` Airflow pool allows at most two concurrent compute tasks.
+- Successful runs return the structured JSON log summary as the XCom `return_value`.
 
-Каждая попытка расчёта пишет одной JSON-записью операторскую сводку: дату и причину запуска, число прочитанных и выбранных заказов, старый и новый агрегаты, состояние публикации, ожидание блокировки, номер попытки и ошибку. Успешная сводка возвращается задачей как XCom `return_value`; при ошибке, включая timeout, JSON записывается до повторного возбуждения исключения, а старый агрегат остаётся опубликованным.
+The complete behavioral contract, including UTC boundaries, retry policy, conflict rules, and late-data semantics, is defined in [`docs/spec.md`](docs/spec.md).
 
-Параметры `demo_delay_seconds`, `demo_fail_first_attempt` и ingestion-параметр `demo_fail_after_commit_once` предназначены только для локальных acceptance/concurrency/timeout/recovery probes. Первый удерживает транзакцию перед публикацией, второй один раз завершает первую попытку после чтения старого агрегата, но до публикации, третий имитирует сбой ingestion после PostgreSQL commit и до Asset event. По умолчанию все механизмы отвергаются; для явно тестового запуска stack нужно стартовать с `DEMO_FAULT_INJECTION_ENABLED=true`.
+## Tests
 
-Локальные unit tests DAG:
+Detailed commands for environment checks, schema validation, unit tests, PostgreSQL integration tests, the Airflow-level acceptance suite, and test-only fault injection are in [`docs/testing.md`](docs/testing.md).
 
-```bash
-docker run --rm --entrypoint pytest \
-  -v "$PWD/dags:/opt/airflow/dags:ro" \
-  -v "$PWD/tests:/opt/airflow/tests:ro" \
-  -w /opt/airflow \
-  airflow-orchestration:3.1.6 \
-  -q tests/unit
-```
+The acceptance suite uses the real scheduler and Celery worker, Airflow API v2, Asset events, task logs, XCom, and both PostgreSQL databases.
 
-После применения схемы integration-проверки дневного расчёта запускаются так:
+## Documentation
 
-```bash
-docker compose exec -T postgres \
-  psql -v ON_ERROR_STOP=1 -U airflow -d orders_demo \
-  < tests/integration/test_daily_aggregate.sql
+- [Behavioral specification](docs/spec.md)
+- [Testing guide](docs/testing.md)
+- [Current implementation status and verification evidence](docs/status.md)
+- [Historical implementation plan](docs/bootstrap.md)
 
-docker run --rm --network airflow-orchestration_default \
-  -e ORDERS_TEST_DSN=postgresql://airflow:airflow@postgres:5432/orders_demo \
-  -v "$PWD/dags:/opt/airflow/dags:ro" \
-  -v "$PWD/tests:/opt/airflow/tests:ro" \
-  -w /opt/airflow \
-  --entrypoint pytest \
-  airflow-orchestration:3.1.6 \
-  -q tests/integration/test_orders_ingestion.py \
-     tests/integration/test_daily_aggregate_concurrency.py
-```
+## Stop the environment
 
-## Airflow-level acceptance suite (V-01)
-
-Acceptance suite использует реальный scheduler/Celery worker, Airflow API v2, Asset events, task logs, XCom и обе PostgreSQL-базы. Вместе с SQL, unit и PostgreSQL integration tests она автоматически покрывает AC-01—AC-13; на Airflow-level дополнительно воспроизводятся эталон R1–R4 и поздний заказ C, повторный расчёт, UTC-граница, retry, успешный и ошибочный late-data пересчёт, сериализация одной даты, параллельность разных дат, pool, реальный timeout, восстановление ingestion после сбоя между commit и Asset event и фактический success XCom. Для безопасных fault/concurrency/timeout probes Airflow-сервисы временно запускаются с явно включённой test-only инъекцией:
-
-```bash
-DEMO_FAULT_INJECTION_ENABLED=true \
-  docker compose up -d --wait --wait-timeout 300
-
-docker run --rm \
-  --network airflow-orchestration_default \
-  -e AIRFLOW_API_BASE_URL=http://airflow-apiserver:8080 \
-  -e AIRFLOW_API_USERNAME=airflow \
-  -e AIRFLOW_API_PASSWORD=airflow \
-  -e ORDERS_TEST_DSN=postgresql://airflow:airflow@postgres:5432/orders_demo \
-  -v "$PWD/tests:/opt/airflow/tests:ro" \
-  -w /opt/airflow \
-  --entrypoint pytest \
-  airflow-orchestration:3.1.6 \
-  -q tests/acceptance/test_airflow_v01.py
-
-# Вернуть обычный режим, взяв значение из .env/default false.
-docker compose up -d --wait --wait-timeout 300
-```
-
-Suite сохраняет исходные pause-состояния DAG. Для каждого запуска она выбирает незанятые даты в диапазоне 2200—2299 и уникальные `order_id`. Добавленные raw events намеренно не удаляются из append-only таблицы; существующие данные и PostgreSQL volume не очищаются.
-
-Для Airflow 3.1.6 задача, ожидающая освобождения pool, наблюдается в состоянии `scheduled`; уточнённый AC-12 также допускает `queued`. Проверка подтверждает контракт ёмкости через task states, timestamps и API pool: одновременно заняты не более двух слотов, третья задача стартует только после освобождения одного из них.
-
-## Остановка
+Stop the services while preserving the PostgreSQL volume:
 
 ```bash
 docker compose down
 ```
 
-Команда сохраняет named volume PostgreSQL. Удаление volume с локальными данными не входит в обычную остановку и не должно выполняться автоматически.
+To explicitly remove all local database data:
+
+```bash
+docker compose down -v
+```
+
+The normal shutdown command does not remove the volume because it may contain user-created events and aggregate results.
