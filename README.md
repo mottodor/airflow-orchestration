@@ -44,6 +44,41 @@ docker compose exec -T postgres \
 
 Повторное применение схемы намеренно проверяется: миграция должна оставаться идемпотентной.
 
+## Приём изменений заказов
+
+DAG `orders_ingestion` запускается вручную и принимает непустой `change_id`, причину изменения и массив append-only версий заказов. Все события одного запуска должны относиться ровно к одной календарной UTC-дате. После успешной записи DAG публикует Asset event таблицы `orders_demo.raw_order_events` с metadata `affected_date`, `reason` и `change_id`.
+
+Пример запуска:
+
+```bash
+docker compose run --rm airflow-cli airflow dags unpause orders_ingestion
+
+docker compose run --rm airflow-cli airflow dags trigger orders_ingestion \
+  --run-id example-late-order-2025-03-03 \
+  --conf '{
+    "change_id": "late-order-c-2025-03-03",
+    "reason": "late_order",
+    "events": [{
+      "order_id": "C",
+      "order_ts": "2025-03-01T15:00:00Z",
+      "amount": 30.00,
+      "updated_at": "2025-03-03T09:00:00Z",
+      "ingested_at": "2025-03-03T09:01:00Z"
+    }]
+  }'
+```
+
+Локальные unit tests DAG:
+
+```bash
+docker run --rm --entrypoint pytest \
+  -v "$PWD/dags:/opt/airflow/dags:ro" \
+  -v "$PWD/tests:/opt/airflow/tests:ro" \
+  -w /opt/airflow \
+  airflow-orchestration:3.1.6 \
+  -q tests/unit/test_orders_ingestion.py
+```
+
 ## Остановка
 
 ```bash
