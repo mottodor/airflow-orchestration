@@ -1,8 +1,12 @@
 # Airflow orchestration and safe backfills
 
-Учебный локальный проект на Apache Airflow 3.1.6. Контракт поведения находится в [`docs/spec.md`](docs/spec.md), план реализации — в [`docs/bootstrap.md`](docs/bootstrap.md).
+Учебный локальный проект на Apache Airflow 3.1.6. Контракт поведения находится в [`docs/spec.md`](docs/spec.md), исторический план реализации — в [`docs/bootstrap.md`](docs/bootstrap.md), фактический статус и известные отклонения — в [`docs/status.md`](docs/status.md).
 
 > Docker Compose предназначен только для локальной разработки и обучения, не для production.
+
+## Текущий статус
+
+Ручные целевые и Asset-triggered пересчёты работают. Scheduled и backfill runs временно заблокированы известным дефектом D-01 при нормализации реального Airflow data interval. До закрытия D-01 не используйте scheduled/backfill режим как подтверждение корректности первого среза; подробности и критерии исправления находятся в [`docs/status.md`](docs/status.md).
 
 ## Требования
 
@@ -43,6 +47,8 @@ docker compose exec -T postgres \
 ```
 
 Повторное применение схемы намеренно проверяется: миграция должна оставаться идемпотентной.
+
+`tests/integration/test_schema.sql` сейчас предполагает чистую тестовую БД. На заполненной persistent `orders_demo` он может завершиться ошибкой из-за ранее сохранённых append-only событий; это известное ограничение D-02 из [`docs/status.md`](docs/status.md), а не признак повреждения схемы.
 
 ## Приём изменений заказов
 
