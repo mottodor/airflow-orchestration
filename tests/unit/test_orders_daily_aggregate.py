@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import sys
 from typing import Any
 
+import pendulum
 import pytest
 from airflow.exceptions import AirflowTaskTimeout
 from airflow.timetables.base import TimeRestriction
@@ -121,6 +122,17 @@ def test_scheduled_run_uses_one_complete_utc_data_interval() -> None:
             "dag_run": SimpleNamespace(run_type=DagRunType.SCHEDULED),
             "data_interval_start": datetime(2025, 3, 1, tzinfo=timezone.utc),
             "data_interval_end": datetime(2025, 3, 2, tzinfo=timezone.utc),
+        }
+    ) == date(2025, 3, 1)
+
+
+def test_scheduled_run_accepts_airflow_pendulum_data_interval() -> None:
+    assert orders_daily_aggregate._resolve_affected_date(
+        {
+            "params": {"affected_date": None},
+            "dag_run": SimpleNamespace(run_type=DagRunType.SCHEDULED),
+            "data_interval_start": pendulum.datetime(2025, 3, 1, tz="UTC"),
+            "data_interval_end": pendulum.datetime(2025, 3, 2, tz="UTC"),
         }
     ) == date(2025, 3, 1)
 

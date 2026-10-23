@@ -2,17 +2,18 @@
 
 - **Нормативный контракт:** [`docs/spec.md`](spec.md)
 - **Исторический план:** [`docs/bootstrap.md`](bootstrap.md)
-- **Проверенный commit реализации:** `3e0a519`
+- **Проверенный baseline реализации:** `3e0a519`
+- **Исправление D-01:** текущий review-ready diff, commit ещё не создан
 - **Дата проверки:** 2026-10-23
-- **Общий статус:** `BLOCKED_BY_D-01`
+- **Общий статус:** `D-01_RESOLVED_OPEN_GAPS`
 
 Этот документ фиксирует изменяемое состояние реализации: фактически выполненные проверки, известные отклонения от утверждённой спецификации, пробелы в acceptance coverage и следующие действия. Он не изменяет требования из `docs/spec.md`.
 
 ## 1. Краткий итог
 
-Локальная среда, схема данных, ingestion, Asset-triggered dispatcher, ручной целевой дневной расчёт, транзакционная публикация, advisory lock, timeout и структурированная сводка реализованы и в основном подтверждены тестами.
+Локальная среда, схема данных, ingestion, Asset-triggered dispatcher, ручной и scheduled дневной расчёт, двухдневный backfill, транзакционная публикация, advisory lock, timeout и структурированная сводка реализованы и в основном подтверждены тестами.
 
-Первый срез пока нельзя считать завершённым: scheduled и backfill paths дневного DAG заблокированы дефектом D-01 при обработке реального `pendulum.DateTime` из Airflow. Дополнительно требуется сделать schema integration test повторяемым на persistent environment и закрыть несколько Airflow-level acceptance gaps.
+Блокирующий дефект D-01 исправлен и подтверждён реальными scheduled/backfill runs. Первый срез всё ещё имеет открытые gaps: требуется сделать schema integration test повторяемым на persistent environment и закрыть несколько Airflow-level acceptance-сценариев.
 
 ## 2. Статус компонентов
 
@@ -24,7 +25,7 @@
 | Append-only ingestion DAG | PASS | Валидация, PostgreSQL insert и Asset metadata работают |
 | Late-data dispatcher | PASS | Дедупликация дат и целевой `TriggerDagRunOperator` работают |
 | Daily aggregate: manual/late-data | PASS | Реальный целевой запуск успешно публикует агрегат |
-| Daily aggregate: scheduled/backfill | BLOCKED | См. D-01 |
+| Daily aggregate: scheduled/backfill | PASS | Pendulum regression test, реальный scheduled run и двухдневный backfill |
 | Latest-version/dedup/conflict SQL | PASS | Подтверждено SQL integration tests |
 | Advisory lock и rollback | PASS | Подтверждено PostgreSQL concurrency tests |
 | Pool `orders_compute` | PARTIAL | Настройка подтверждена; Airflow-level сценарий трёх задач не автоматизирован |
@@ -67,7 +68,7 @@ Host LSP не разрешает импорты Airflow и `psycopg2`, пото�
 
 | Набор | Результат |
 |---|---|
-| `tests/unit` | PASS — 39 tests |
+| `tests/unit` | PASS — 40 tests |
 | `tests/integration/test_daily_aggregate.sql` | PASS |
 | `tests/integration/test_daily_aggregate_concurrency.py` | PASS — 3 tests |
 | `tests/integration/test_schema.sql` на чистой временной БД | PASS |
@@ -123,46 +124,32 @@ orders_ingestion
 ### D-01 — Scheduled data interval отвергается
 
 - **Severity:** BLOCKER
-- **Компонент:** `dags/orders_daily_aggregate.py:87-89`
+- **Статус:** RESOLVED
+- **Компонент:** `dags/orders_daily_aggregate.py`, `tests/unit/test_orders_daily_aggregate.py`
 - **Затронутые критерии:** AC-01, AC-03 и обязательный backfill path
+- **Commit:** не создан; исправление находится в текущем review-ready diff
 
-#### Наблюдаемое поведение
+#### Историческое поведение и причина
 
-Scheduled task завершается ошибкой:
+Airflow передавал границы data interval как `pendulum.DateTime`, а реализация сравнивала результат Pendulum-арифметики со значением, использующим stdlib timezone. Корректный дневной интервал ошибочно отвергался с сообщением:
 
 ```text
 ValueError: the Airflow data interval must be one complete UTC day
 ```
 
-В проверенной metadata DB зафиксировано 606 failed scheduled runs. Ручные и Asset-triggered runs с явным `affected_date` этим дефектом не затронуты.
+#### Исправление
 
-#### Причина
+Обе границы теперь преобразуются в стандартный timezone-aware `datetime` в UTC через их абсолютный timestamp. После нормализации проверяются UTC-полночь начала и точное окончание в полночь следующей календарной даты. Добавлен отдельный regression test с реальными `pendulum.DateTime`; существующие отрицательные тесты по-прежнему отвергают неполный и многодневный интервалы.
 
-Airflow передаёт границы data interval как `pendulum.DateTime`. Текущая проверка вычисляет:
+#### Проверки
 
-```python
-expected_end = utc_start + timedelta(days=1)
-```
-
-В наблюдаемой комбинации Pendulum и stdlib timezone полученный `expected_end` отличается по timezone awareness от корректного `utc_end`, поэтому равные календарные границы сравниваются как неравные.
-
-Unit-тест `test_scheduled_run_uses_one_complete_utc_data_interval` использует стандартный `datetime` и не воспроизводит реальный runtime type.
-
-#### Требуемое исправление
-
-- нормализовать обе границы к одному типу без потери timezone;
-- проверять UTC-полночь и ровно одну календарную дату;
-- добавить regression test с `pendulum.DateTime`;
-- выполнить настоящий scheduled run;
-- выполнить настоящий `airflow backfill create` минимум для двух дат.
-
-#### Definition of Done
-
-- regression test падает на старой реализации и проходит после исправления;
-- scheduled run публикует корректный агрегат;
-- backfill выбранного диапазона завершается успешно;
-- новые ошибки `complete UTC day` отсутствуют;
-- AC-01 и backfill-часть AC-03 получают достаточное runtime evidence.
+- regression probe на старой реализации воспроизвёл `ValueError` для корректного Pendulum-интервала;
+- targeted regression и negative tests: PASS — 4 tests;
+- весь `tests/unit`: PASS — 40 tests;
+- `airflow dags list-import-errors`: PASS — ошибок нет;
+- реальный scheduled run `scheduled__2026-10-20T00:00:00+00:00`: PASS, опубликован независимый эталон `order_count=2`, `sales_amount=170.00`;
+- `airflow backfill create` для `2026-10-18`—`2026-10-19`, `max_active_runs=2`: PASS, оба run завершены успешно и опубликовали по одной корректной строке;
+- в финальных attempt logs этих трёх запусков отсутствуют `complete UTC day`, `ValueError` и traceback.
 
 ### D-02 — Schema integration test зависит от пустой БД
 
@@ -235,9 +222,9 @@ Raw table append-only, поэтому ранее созданные строки
 
 | AC | Статус | Evidence / ограничение |
 |---|---|---|
-| AC-01 | BLOCKED | SQL/manual расчёт работает, scheduled path заблокирован D-01 |
+| AC-01 | PASS | Реальный scheduled run на независимом fixture R1–R4 опубликовал ровно `2 / 170.00` |
 | AC-02 | PARTIAL | rollback и сохранение старого результата подтверждены; нужен единый fail-then-success Airflow retry scenario |
-| AC-03 | PARTIAL | Повторный SQL расчёт идемпотентен; Airflow backfill заблокирован D-01 |
+| AC-03 | PASS | SQL-идемпотентность подтверждена ранее; реальный двухдневный Airflow backfill завершён успешно, по одной активной строке на дату |
 | AC-04 | PASS | Latest version и exact duplicate проверены |
 | AC-05 | PASS | Конфликт блокирует публикацию и сохраняет старый результат |
 | AC-06 | PASS | Реальный ingestion -> Asset -> dispatcher -> target run выполнен |
@@ -251,12 +238,10 @@ Raw table append-only, поэтому ранее созданные строки
 
 ## 10. Приоритет следующих изменений
 
-1. Исправить D-01 и добавить Pendulum regression test.
-2. Выполнить scheduled и backfill runtime probes.
-3. Исправить D-02 и сделать документированную schema test command повторяемой.
-4. Добавить минимальный Airflow-level acceptance suite для V-01.
-5. После подтверждения всех обязательных режимов обновить AC-матрицу и общий статус.
-6. Отдельным решением очистить или пересоздать локальную metadata DB, если для демонстрации нужна история без 606 старых failed runs.
+1. Исправить D-02 и сделать документированную schema test command повторяемой.
+2. Добавить минимальный Airflow-level acceptance suite для V-01.
+3. После подтверждения всех обязательных режимов обновить AC-матрицу и общий статус.
+4. Отдельным решением очистить или пересоздать локальную metadata DB, если для демонстрации нужна история без старых failed runs.
 
 ## 11. Правила обновления документа
 

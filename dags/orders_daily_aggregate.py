@@ -82,10 +82,12 @@ def _resolve_affected_date(context: Mapping[str, Any]) -> date:
     if interval_start.tzinfo is None or interval_end.tzinfo is None:
         raise ValueError("the Airflow data interval must be timezone-aware")
 
-    utc_start = interval_start.astimezone(timezone.utc)
-    utc_end = interval_end.astimezone(timezone.utc)
-    expected_end = utc_start + timedelta(days=1)
-    if utc_start.timetz() != time(0, tzinfo=timezone.utc) or utc_end != expected_end:
+    utc_start = datetime.fromtimestamp(interval_start.timestamp(), tz=timezone.utc)
+    utc_end = datetime.fromtimestamp(interval_end.timestamp(), tz=timezone.utc)
+    expected_end = datetime.combine(
+        utc_start.date() + timedelta(days=1), time.min, tzinfo=timezone.utc
+    )
+    if utc_start.time() != time.min or utc_end != expected_end:
         raise ValueError("the Airflow data interval must be one complete UTC day")
 
     return utc_start.date()

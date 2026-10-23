@@ -6,7 +6,7 @@
 
 ## Текущий статус
 
-Ручные целевые и Asset-triggered пересчёты работают. Scheduled и backfill runs временно заблокированы известным дефектом D-01 при нормализации реального Airflow data interval. До закрытия D-01 не используйте scheduled/backfill режим как подтверждение корректности первого среза; подробности и критерии исправления находятся в [`docs/status.md`](docs/status.md).
+Ручные, Asset-triggered и scheduled пересчёты работают; исправление D-01 подтверждено Pendulum regression test, реальным scheduled run и двухдневным backfill. Первый срез сохраняет открытые gaps D-02 и V-01; актуальные результаты и ограничения находятся в [`docs/status.md`](docs/status.md).
 
 ## Требования
 
