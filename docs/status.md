@@ -2,9 +2,10 @@
 
 - **Нормативный контракт:** [`docs/spec.md`](spec.md)
 - **Исторический план:** [`docs/bootstrap.md`](bootstrap.md)
-- **Проверенный baseline реализации:** `d1bc900`
-- **Работа по V-01:** текущий diff, commit ещё не создан
-- **Дата проверки:** 2026-10-23
+- **Текущий проверенный baseline:** `bc93814`
+- **V-01:** закрыт commit `8b8da7d`
+- **IMP-08:** закрыт commit `bc93814`
+- **Дата актуализации:** 2026-10-23
 - **Общий статус:** `READY_FOR_ACCEPTANCE`
 
 Этот документ фиксирует изменяемое состояние реализации: фактически выполненные проверки, известные отклонения от утверждённой спецификации, пробелы в acceptance coverage и следующие действия. Он не изменяет требования из `docs/spec.md`.
@@ -69,7 +70,7 @@ Host LSP не разрешает импорты Airflow и `psycopg2`, пото�
 | Набор | Результат |
 |---|---|
 | `tests/unit` | PASS — 47 tests |
-| `tests/acceptance/test_airflow_v01.py` | PASS — 5 Airflow-level scenarios |
+| `tests/acceptance/test_airflow_v01.py` | PASS — 7 Airflow-level scenarios |
 | `tests/integration/test_daily_aggregate.sql` | PASS |
 | `tests/integration/test_daily_aggregate_concurrency.py` | PASS — 3 tests |
 | `tests/integration/test_schema.sql` на чистой временной БД | PASS |
@@ -186,7 +187,7 @@ Raw table append-only, поэтому ранее созданные строки
 - **Статус:** RESOLVED
 - **Затронутые критерии:** AC-02, AC-07, AC-08, AC-09, AC-10, AC-12
 - **Компоненты:** `dags/orders_daily_aggregate.py`, `tests/acceptance/test_airflow_v01.py`, `tests/unit/test_orders_daily_aggregate.py`, `README.md`
-- **Commit:** не создан; закрытие находится в текущем review-ready diff
+- **Commit:** `8b8da7d`
 
 Добавлен test-only параметр `demo_fail_first_attempt`, доступный только при `DEMO_FAULT_INJECTION_ENABLED=true`. Первая попытка получает advisory lock, читает старый агрегат и завершается до публикации; штатный retry того же Airflow run затем выполняет реальный расчёт. По умолчанию механизм отключён и отвергается, как и существующий `demo_delay_seconds`.
 
@@ -241,10 +242,10 @@ Suite выбирает незанятые даты 2200—2299 и уникаль
 
 ## 10. Приоритет следующих изменений
 
-1. Провести финальный независимый review уточнённого AC-12 и текущего V-01 diff.
-2. Создать commit после решения пользователя.
-3. При необходимости добавить CI для unit/integration/acceptance уровней отдельной задачей.
-4. Отдельным решением очистить или пересоздать локальную metadata DB, если для демонстрации нужна история без старых failed runs.
+1. Провести пользовательскую приёмку текущего baseline `bc93814`.
+2. При необходимости добавить CI для unit/integration/acceptance уровней отдельной задачей.
+3. Отдельно решить, требуется ли снижать риск R-01 через retry, идемпотентный `change_id`, outbox или reconciliation DAG.
+4. При необходимости очистить или пересоздать локальную metadata DB, если для демонстрации нужна история без старых failed runs.
 
 ## 11. Правила обновления документа
 
@@ -257,9 +258,10 @@ Suite выбирает незанятые даты 2200—2299 и уникаль
 ## TASK_ID: IMP-08
 
 - Source: `docs/bootstrap.md` §6, строка IMP-08; `docs/spec.md` §4 «Утверждённый эталон данных» и §5 AC-01—AC-13
-- Status: REVIEW_READY
-- Updated: 2026-10-23T23:23:41+03:00
+- Status: COMPLETED
+- Updated: 2026-10-23T23:36:11+03:00
 - Baseline HEAD: 8b8da7d52a5e731ce6ec6c434090cdb1c774080c
+- Result commit: bc93814512369f89fbfb3162c666ed62b4eda7a9
 
 ### Progress
 - Implemented: extended `tests/acceptance/test_airflow_v01.py` to run the approved R1–R4 fixture, repeat calculation, adjacent UTC-boundary fixtures, successful late order C through ingestion/Asset/dispatcher, and a real two-attempt Airflow timeout; isolated all seven Airflow scenarios on 12 consecutive unused dates; updated `README.md` coverage description
@@ -305,7 +307,7 @@ Suite выбирает незанятые даты 2200—2299 и уникаль
 - Verdict: OK
 - Calls: 3
 - Fix iterations: 1
-- Details: Reviewer call 1 blocked missing in-progress AC-06 evidence. Targeted fix iteration 1 added and verified the external advisory-lock snapshot assertion. Reviewer calls 2 and 3 returned `VERDICT OK`; call 3 confirmed the status-only progress correction and full tracked diff remain review-ready, with no blocker or deferred issue. P2 improvement: the preserved legacy global status table still says the acceptance file has 5 scenarios although the current file has 7; this known non-blocking inconsistency was not changed because IMP-08 status updates must preserve existing general text and non-task sections. Runtime is running/healthy with fault injection false; PostgreSQL volume is preserved.
+- Details: Reviewer call 1 blocked missing in-progress AC-06 evidence. Targeted fix iteration 1 added and verified the external advisory-lock snapshot assertion. Reviewer calls 2 and 3 returned `VERDICT OK`; call 3 confirmed the status-only progress correction and full tracked diff, with no blocker or deferred issue. The previously noted P2 inconsistency in the global test table is corrected: the acceptance file contains 7 scenarios. Runtime is running/healthy with fault injection false; PostgreSQL volume is preserved.
 
 ### Next action
-User reviews the three-file checkpoint and decides whether to create the proposed commit.
+Use `bc93814` as the current acceptance baseline. Remaining work is optional and tracked in section 10: user acceptance, CI, a decision on R-01, and optional cleanup of local runtime history.
