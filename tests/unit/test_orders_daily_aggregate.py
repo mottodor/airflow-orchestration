@@ -579,7 +579,7 @@ def test_dag_has_the_daily_utc_data_interval_contract() -> None:
     assert dag.dag_id == "orders_daily_aggregate"
     assert dag.catchup is True
     assert dag.max_active_runs == 4
-    assert dag.start_date == datetime(2025, 3, 1, tzinfo=timezone.utc)
+    assert dag.start_date == datetime(2026, 10, 1, tzinfo=timezone.utc)
     assert isinstance(dag.timetable, CronDataIntervalTimetable)
     assert dag.timetable.summary == "0 0 * * *"
 
@@ -607,8 +607,8 @@ def test_dag_has_the_daily_utc_data_interval_contract() -> None:
     )
     assert first_run is not None
     assert first_run.data_interval.start == datetime(
-        2025, 3, 1, tzinfo=timezone.utc
+        2026, 10, 1, tzinfo=timezone.utc
     )
     assert first_run.data_interval.end == datetime(
-        2025, 3, 2, tzinfo=timezone.utc
+        2026, 10, 2, tzinfo=timezone.utc
     )

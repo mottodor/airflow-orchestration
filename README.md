@@ -72,21 +72,21 @@ Trigger ingestion with one late order:
 
 ```bash
 docker compose run --rm airflow-cli airflow dags trigger orders_ingestion \
-  --run-id example-late-order-2025-03-03 \
+  --run-id example-late-order-2026-10-03 \
   --conf '{
-    "change_id": "late-order-c-2025-03-03",
+    "change_id": "late-order-c-2026-10-03",
     "reason": "late_order",
     "events": [{
       "order_id": "C",
-      "order_ts": "2025-03-01T15:00:00Z",
+      "order_ts": "2026-10-01T15:00:00Z",
       "amount": 30.00,
-      "updated_at": "2025-03-03T09:00:00Z",
-      "ingested_at": "2025-03-03T09:01:00Z"
+      "updated_at": "2026-10-03T09:00:00Z",
+      "ingested_at": "2026-10-03T09:01:00Z"
     }]
   }'
 ```
 
-This starts the complete workflow: ingestion publishes an Asset event, the dispatcher creates a targeted run, and the daily DAG recalculates `2025-03-01`.
+This starts the complete workflow: ingestion publishes an Asset event, the dispatcher creates a targeted run, and the daily DAG recalculates `2026-10-01`.
 
 Use the Airflow UI to inspect DAG runs, task states, logs, and the successful task's XCom value.
 
@@ -94,8 +94,8 @@ To run the daily aggregate directly:
 
 ```bash
 docker compose run --rm airflow-cli airflow dags trigger orders_daily_aggregate \
-  --run-id example-daily-2025-03-01 \
-  --conf '{"affected_date": "2025-03-01"}'
+  --run-id example-daily-2026-10-01 \
+  --conf '{"affected_date": "2026-10-01"}'
 ```
 
 ## Safety guarantees

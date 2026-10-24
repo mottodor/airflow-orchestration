@@ -19,7 +19,7 @@ ORDERS_DB_CONN_ID = "orders_db"
 ORDERS_COMPUTE_POOL = "orders_compute"
 EXECUTION_TIMEOUT = timedelta(seconds=10)
 RETRY_DELAY = timedelta(seconds=5)
-ADVISORY_LOCK_NAMESPACE = 20250301
+ADVISORY_LOCK_NAMESPACE = 20261001
 
 LOGGER = logging.getLogger(__name__)
 
@@ -395,7 +395,7 @@ with DAG(
     dag_id="orders_daily_aggregate",
     description="Atomically publish the aggregate for one UTC calendar date.",
     schedule=CronDataIntervalTimetable("0 0 * * *", timezone="UTC"),
-    start_date=datetime(2025, 3, 1, tzinfo=timezone.utc),
+    start_date=datetime(2026, 10, 1, tzinfo=timezone.utc),
     catchup=True,
     max_active_runs=4,
     params={
