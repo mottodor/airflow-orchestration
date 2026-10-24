@@ -1,0 +1,13 @@
+{
+  "change_id": "late-order-c-2026-10-03-v1",
+  "reason": "late_order",
+  "events": [
+    {
+      "order_id": "C",
+      "order_ts": "2026-10-01T15:00:00Z",
+      "amount": 30.00,
+      "updated_at": "2026-10-03T09:00:00Z",
+      "ingested_at": "2026-10-03T09:01:00Z"
+    }
+  ]
+}

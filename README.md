@@ -60,6 +60,8 @@ If `AIRFLOW_API_PORT` was changed, use `http://localhost:<AIRFLOW_API_PORT>` ins
 
 ## Run the example
 
+Ready-to-use configurations for the initial load and a late change are available in [`data/`](data/).
+
 All DAGs are paused when first created. Unpause the project DAGs:
 
 ```bash
@@ -67,6 +69,8 @@ docker compose run --rm airflow-cli airflow dags unpause orders_ingestion
 docker compose run --rm airflow-cli airflow dags unpause orders_late_data_dispatcher
 docker compose run --rm airflow-cli airflow dags unpause orders_daily_aggregate
 ```
+
+Alternatively, open the **Dags** page in the Airflow UI and switch on the toggle next to each of these three DAGs.
 
 Trigger ingestion with one late order:
 
@@ -86,6 +90,13 @@ docker compose run --rm airflow-cli airflow dags trigger orders_ingestion \
   }'
 ```
 
+To trigger the same run through the Airflow UI:
+
+1. Open **Dags** and select `orders_ingestion`.
+2. Click **Trigger**, then select **Single Run**.
+3. Expand **Advanced Config** and paste the JSON object from `--conf` above into the DAG run configuration field.
+4. Optionally set the run ID to `example-late-order-2026-10-03`, then confirm the trigger.
+
 This starts the complete workflow: ingestion publishes an Asset event, the dispatcher creates a targeted run, and the daily DAG recalculates `2026-10-01`.
 
 Use the Airflow UI to inspect DAG runs, task states, logs, and the successful task's XCom value.
@@ -97,6 +108,8 @@ docker compose run --rm airflow-cli airflow dags trigger orders_daily_aggregate 
   --run-id example-daily-2026-10-01 \
   --conf '{"affected_date": "2026-10-01"}'
 ```
+
+In the UI, open `orders_daily_aggregate`, click **Trigger** → **Single Run**, and enter `{"affected_date": "2026-10-01"}` in **Advanced Config**.
 
 ## Safety guarantees
 
